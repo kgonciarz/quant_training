@@ -225,6 +225,61 @@ def summarize_trades(trades: List[Trade]) -> Tuple[float, float]:
     total_ret = 1.0
     for t in closed: total_ret *= (1 + t.pnl_pct / 100)
     return win_rate, (total_ret - 1) * 100
+# ---------- Optimizer helpers ----------
+def evaluate_once(prices, sr_window, cluster_tol, buffer_pct, atr_period, stop_atr, take_atr):
+    sr = detect_sr(prices, sr_window, cluster_tol)
+    trades, equity = backtest(prices, sr, buffer_pct, atr_period, stop_atr, take_atr)
+    win, net = summarize_trades(trades)
+    mdd = max_drawdown(equity)
+    n_trades = len([t for t in trades if t.pnl_pct is not None])
+    return {
+        "sr_window": sr_window, "cluster_tol": cluster_tol, "buffer_pct": buffer_pct,
+        "atr_period": atr_period, "stop_atr": stop_atr, "take_atr": take_atr,
+        "win_rate": win, "net": net, "mdd": mdd, "trades": n_trades,
+        "trades_list": trades, "equity": equity, "sr_levels": sr
+    }
+
+def optimize_params(prices, min_trades=4, dd_penalty=0.7):
+    # Small, fast grid (tweak as you like)
+    sw_opts   = [15, 19, 25, 31]
+    tol_opts  = [0.3, 0.6, 1.0]
+    buf_opts  = [0.2, 0.5, 1.0]
+    atr_opts  = [10, 14, 20]
+    stop_opts = [1.5, 2.0, 2.5]
+    take_opts = [2.0, 3.0, 4.0]
+
+    rows = []
+    best = None
+    for sw in sw_opts:
+        for tol in tol_opts:
+            # compute SR once per (sw, tol) to speed up
+            sr_cache = detect_sr(prices, sw, tol)
+            for buf in buf_opts:
+                for atrp in atr_opts:
+                    for sl in stop_opts:
+                        for tp in take_opts:
+                            trades, equity = backtest(prices, sr_cache, buf, atrp, sl, tp)
+                            win, net = summarize_trades(trades)
+                            mdd = max_drawdown(equity)
+                            n   = len([t for t in trades if t.pnl_pct is not None])
+
+                            # score: reward profit, penalize drawdown, penalize too few trades
+                            score = net - max(0, mdd) * dd_penalty
+                            if n < min_trades:
+                                score -= 50.0
+
+                            row = {
+                                "sr_window": sw, "cluster_tol": tol, "buffer_pct": buf,
+                                "atr_period": atrp, "stop_atr": sl, "take_atr": tp,
+                                "win_rate": win, "net": net, "mdd": mdd, "trades": n,
+                                "score": score
+                            }
+                            rows.append(row)
+                            if best is None or score > best["score"]:
+                                best = row.copy()
+
+    grid = pd.DataFrame(rows).sort_values("score", ascending=False)
+    return best, grid
 
 # ----------------------------
 # Sidebar Controls
@@ -242,6 +297,7 @@ with st.sidebar:
     stop_atr = st.slider("Stop Loss (×ATR)", 0.5, 5.0, 2.0, step=0.1)
     take_atr = st.slider("Take Profit (×ATR)", 0.5, 8.0, 3.0, step=0.1)
     refresh = st.button("🔄 Refresh data")
+    optimize_click = st.button("🧪 Optimize (profit ↑ / drawdown ↓)")
 
 if start_date >= end_date:
     st.error("Start date must be before end date."); st.stop()
@@ -249,23 +305,91 @@ if start_date >= end_date:
 with st.spinner("Fetching cocoa prices…"):
     prices = get_prices(TICKER, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
 
+# If user wants to apply the optimizer result to the chart
+if "opt_best" in st.session_state and st.session_state["opt_best"]:
+    with st.expander("Best parameters found (click 'Apply' to use them)"):
+        b = st.session_state["opt_best"]
+        st.write(pd.DataFrame([b]))
+        if st.button("✅ Apply best params to chart"):
+            st.session_state["override_params"] = {
+                "sr_window": int(b["sr_window"]),
+                "cluster_tol": float(b["cluster_tol"]),
+                "buffer_pct": float(b["buffer_pct"]),
+                "atr_period": int(b["atr_period"]),
+                "stop_atr": float(b["stop_atr"]),
+                "take_atr": float(b["take_atr"]),
+            }
+            st.experimental_rerun()
+    # Optional: show top 20 candidates
+    if "opt_grid" in st.session_state:
+        st.dataframe(st.session_state["opt_grid"].head(20), use_container_width=True)
+        
+# If user wants to apply the optimizer result to the chart
+if "opt_best" in st.session_state and st.session_state["opt_best"]:
+    with st.expander("Best parameters found (click 'Apply' to use them)"):
+        b = st.session_state["opt_best"]
+        st.write(pd.DataFrame([b]))
+        if st.button("✅ Apply best params to chart"):
+            st.session_state["override_params"] = {
+                "sr_window": int(b["sr_window"]),
+                "cluster_tol": float(b["cluster_tol"]),
+                "buffer_pct": float(b["buffer_pct"]),
+                "atr_period": int(b["atr_period"]),
+                "stop_atr": float(b["stop_atr"]),
+                "take_atr": float(b["take_atr"]),
+            }
+            st.experimental_rerun()
+    # Optional: show top 20 candidates
+    if "opt_grid" in st.session_state:
+        st.dataframe(st.session_state["opt_grid"].head(20), use_container_width=True)
+
+# run optimizer
+if optimize_click:
+    with st.spinner("Searching best parameters…"):
+        best, grid = optimize_params(prices)
+    st.session_state["opt_best"] = best
+    st.session_state["opt_grid"] = grid
+    st.success("Optimization done!")
+
 if prices.empty:
     st.warning("No data returned."); st.stop()
+
 
 # ----------------------------
 # Strategy & Metrics
 # ----------------------------
-sr_levels = detect_sr(prices, sr_window, cluster_tol)
-trend_val = slope(prices["Close"], 50).iloc[-1]
-trend_val = float(trend_val) if pd.notna(trend_val) else 0.0
-bias = "LONG" if trend_val > 0 else "SHORT"
+# Use sliders by default; override with optimizer choice if available
+params = {
+    "sr_window": sr_window,
+    "cluster_tol": cluster_tol,
+    "buffer_pct": buffer_pct,
+    "atr_period": atr_period,
+    "stop_atr": stop_atr,
+    "take_atr": take_atr,
+}
+if "override_params" in st.session_state:
+    params.update(st.session_state["override_params"])
+    st.caption(f"Using optimized params: {params}")
 
-ns_price = nearest_level(float(prices["Close"].iloc[-1]), sr_levels.support)
-nr_price = nearest_level(float(prices["Close"].iloc[-1]), sr_levels.resistance)
+# --- Strategy & Metrics using `params` ---
+sr_levels   = detect_sr(prices, params["sr_window"], params["cluster_tol"])
+trend_val   = slope(prices["Close"], 50).iloc[-1]
+trend_val   = float(trend_val) if pd.notna(trend_val) else 0.0
+bias        = "LONG" if trend_val > 0 else "SHORT"
+last_close  = float(prices['Close'].iloc[-1])
+ns_price    = nearest_level(last_close, sr_levels.support)
+nr_price    = nearest_level(last_close, sr_levels.resistance)
 
-trades, equity = backtest(prices, sr_levels, buffer_pct, atr_period, stop_atr, take_atr)
+trades, equity = backtest(
+    prices, sr_levels,
+    buffer_pct=params["buffer_pct"],
+    atr_period=params["atr_period"],
+    stop_atr=params["stop_atr"],
+    take_atr=params["take_atr"],
+)
 win_rate, total_return = summarize_trades(trades)
 mdd = max_drawdown(equity)
+
 
 colA, colB, colC, colD, colE, colF = st.columns([1.2, 1, 1, 1, 1, 1.2])
 colA.markdown(f"### 📊 Current Bias: **{bias}**")
