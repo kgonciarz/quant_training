@@ -323,25 +323,7 @@ if "opt_best" in st.session_state and st.session_state["opt_best"]:
     # Optional: show top 20 candidates
     if "opt_grid" in st.session_state:
         st.dataframe(st.session_state["opt_grid"].head(20), use_container_width=True)
-        
-# If user wants to apply the optimizer result to the chart
-if "opt_best" in st.session_state and st.session_state["opt_best"]:
-    with st.expander("Best parameters found (click 'Apply' to use them)"):
-        b = st.session_state["opt_best"]
-        st.write(pd.DataFrame([b]))
-        if st.button("✅ Apply best params to chart"):
-            st.session_state["override_params"] = {
-                "sr_window": int(b["sr_window"]),
-                "cluster_tol": float(b["cluster_tol"]),
-                "buffer_pct": float(b["buffer_pct"]),
-                "atr_period": int(b["atr_period"]),
-                "stop_atr": float(b["stop_atr"]),
-                "take_atr": float(b["take_atr"]),
-            }
-            st.experimental_rerun()
-    # Optional: show top 20 candidates
-    if "opt_grid" in st.session_state:
-        st.dataframe(st.session_state["opt_grid"].head(20), use_container_width=True)
+
 
 # run optimizer
 if optimize_click:
