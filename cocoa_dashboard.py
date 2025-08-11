@@ -264,9 +264,10 @@ def optimize_params(prices, min_trades=4, dd_penalty=0.7):
                             n   = len([t for t in trades if t.pnl_pct is not None])
 
                             # score: reward profit, penalize drawdown, penalize too few trades
-                            score = net - max(0, mdd) * dd_penalty
+                            score = (net * 2.0) + (win * 0.5) - (max(0, mdd) * dd_penalty)
                             if n < min_trades:
                                 score -= 50.0
+
 
                             row = {
                                 "sr_window": sw, "cluster_tol": tol, "buffer_pct": buf,
