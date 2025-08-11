@@ -52,7 +52,7 @@ def get_prices(symbol: str, start: str, end: str) -> pd.DataFrame:
     df = df.sort_index()
 
     return df
-prices = get_prices("CC=F", start, end)
+
 # Sidebar date pickers
 import datetime as dt
 
