@@ -20,6 +20,18 @@ st.set_page_config(page_title="Cocoa Dashboard", layout="wide", initial_sidebar_
 # ----------------------------
 # Utils
 # ----------------------------
+# Sidebar date pickers
+import datetime as dt
+
+start = st.sidebar.date_input("Start Date", dt.date(2015, 1, 1))
+end = st.sidebar.date_input("End Date", dt.date.today())
+
+# Convert to string for get_prices()
+start_str = start.strftime("%Y-%m-%d")
+end_str = end.strftime("%Y-%m-%d")
+
+prices = get_prices("CC=F", start_str, end_str)
+
 import pandas as pd
 import yfinance as yf
 
