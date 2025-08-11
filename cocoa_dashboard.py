@@ -273,7 +273,8 @@ trend_slope = slope(prices["Close"], 50)
 last_close = float(prices["Close"].iloc[-1])
 ns_price = nearest_level(last_close, sr_levels.support)
 nr_price = nearest_level(last_close, sr_levels.resistance)
-trend_up = (trend_slope.iloc[-1] or 0) > 0
+trend_val = float(trend_slope.iloc[-1]) if pd.notna(trend_slope.iloc[-1]) else 0.0
+trend_up = trend_val > 0
 bias = "LONG" if trend_up else "SHORT"
 
 trades, equity = backtest(
