@@ -319,7 +319,8 @@ if "opt_best" in st.session_state and st.session_state["opt_best"]:
                 "stop_atr": float(b["stop_atr"]),
                 "take_atr": float(b["take_atr"]),
             }
-            st.experimental_rerun()
+            st.rerun()
+
     # Optional: show top 20 candidates
     if "opt_grid" in st.session_state:
         st.dataframe(st.session_state["opt_grid"].head(20), use_container_width=True)
