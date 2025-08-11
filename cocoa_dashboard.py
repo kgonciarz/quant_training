@@ -16,23 +16,80 @@ st.set_page_config(page_title="Cocoa Dashboard", layout="wide", initial_sidebar_
 # ----------------------------
 # Utilities
 # ----------------------------
-def get_prices(symbol: str, start: str, end: str) -> pd.DataFrame:
-    df = yf.download(symbol, start=start, end=end, progress=False, auto_adjust=True)
-    if df.empty:
-        raise ValueError(f"No data for {symbol} in range {start} -> {end}")
+def get_prices(symbol: str, start, end) -> pd.DataFrame:
+    import time
+    import datetime as _dt
 
-    # Flatten possible multiindex
-    if isinstance(df.columns, pd.MultiIndex):
-        if symbol in df.columns.get_level_values(0):
-            df = df.xs(symbol, axis=1, level=0)
-        else:
-            df = df.droplevel(0, axis=1)
+    # allow date, datetime, or str
+    if isinstance(start, (_dt.date, _dt.datetime)):
+        start = _dt.datetime.combine(start, _dt.time.min).strftime("%Y-%m-%d")
+    if isinstance(end, (_dt.date, _dt.datetime)):
+        end = _dt.datetime.combine(end, _dt.time.min).strftime("%Y-%m-%d")
 
-    df.columns = [c.title() for c in df.columns]
-    cols = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
-    df = df[cols].copy()
-    df.index = pd.to_datetime(df.index)
-    return df.sort_index()
+    def _normalize(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        if isinstance(df.columns, pd.MultiIndex):
+            # ('CC=F','Close') … or ('Close','')
+            if symbol in df.columns.get_level_values(0):
+                df = df.xs(symbol, axis=1, level=0)
+            else:
+                df = df.droplevel(0, axis=1)
+        df = df.rename(columns=lambda c: c.title())
+        keep = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
+        df = df[keep].copy()
+        df.index = pd.to_datetime(df.index)
+        return df.sort_index()
+
+    # 1) Try download() a few times (Yahoo can be moody)
+    for _ in range(3):
+        df = yf.download(
+            symbol,
+            start=start,
+            end=end,               # Yahoo's end is exclusive (we’ll try +1d later)
+            auto_adjust=True,
+            interval="1d",
+            progress=False,
+            threads=False,
+        )
+        df = _normalize(df)
+        if not df.empty:
+            return df
+        time.sleep(1.2)
+
+    # 2) Try history() with end+1 day (fixes end-exclusive empties)
+    try:
+        end_plus = (pd.to_datetime(end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        df = yf.Ticker(symbol).history(
+            start=start, end=end_plus, auto_adjust=True, interval="1d"
+        )
+        df = _normalize(df)
+        if not df.empty:
+            return df
+    except Exception:
+        pass
+
+    # 3) Last resort: period-based fetch then slice
+    try:
+        days = max(1, (pd.to_datetime(end) - pd.to_datetime(start)).days)
+        years = max(1, days // 365)
+        df = yf.download(
+            symbol, period=f"{years}y", auto_adjust=True, interval="1d",
+            progress=False, threads=False
+        )
+        df = _normalize(df)
+        if not df.empty:
+            df = df.loc[(df.index >= pd.to_datetime(start)) & (df.index <= pd.to_datetime(end))]
+            if not df.empty:
+                return df
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        f"Yahoo returned no daily data for {symbol} in {start} → {end}. "
+        "Try a shorter range, click Refresh again, or temporarily switch network/VPN."
+    )
+
 
 def today_utc():
     return dt.datetime.utcnow().date()
