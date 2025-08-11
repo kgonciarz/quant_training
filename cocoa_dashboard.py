@@ -9,114 +9,64 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
-# ----------------------------
-# Config
-# ----------------------------
-TICKER = "CC=F"  # ICE Cocoa futures (delayed)
+TICKER = "CC=F"
 DEFAULT_YEARS = 3
-
 st.set_page_config(page_title="Cocoa Dashboard", layout="wide", initial_sidebar_state="collapsed")
 
 # ----------------------------
-# Utils
+# Utilities
 # ----------------------------
-
-import pandas as pd
-import yfinance as yf
-
 def get_prices(symbol: str, start: str, end: str) -> pd.DataFrame:
     df = yf.download(symbol, start=start, end=end, progress=False, auto_adjust=True)
     if df.empty:
         raise ValueError(f"No data for {symbol} in range {start} -> {end}")
 
-    # Normalize columns to a flat OHLCV frame
+    # Flatten possible multiindex
     if isinstance(df.columns, pd.MultiIndex):
-        # Case 1: columns like ('CC=F','Close'), ('CC=F','Open'), ...
         if symbol in df.columns.get_level_values(0):
             df = df.xs(symbol, axis=1, level=0)
         else:
-            # Case 2: columns like ('Close',''), ('Open','') -> just drop top level
             df = df.droplevel(0, axis=1)
 
-    # Standardize names
-    rename = {c: c.title() for c in df.columns}
-    df = df.rename(columns=rename)
-
-    # Keep only the usual suspects if present
+    df.columns = [c.title() for c in df.columns]
     cols = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
-    df = df[cols]
-
-    # Ensure DatetimeIndex and sorted
-    df = df.copy()
+    df = df[cols].copy()
     df.index = pd.to_datetime(df.index)
-    df = df.sort_index()
-
-    return df
-
-# Sidebar date pickers
-import datetime as dt
-
-start = st.sidebar.date_input("Start Date", dt.date(2015, 1, 1))
-end = st.sidebar.date_input("End Date", dt.date.today())
-
-# Convert to string for get_prices()
-start_str = start.strftime("%Y-%m-%d")
-end_str = end.strftime("%Y-%m-%d")
-
-prices = get_prices("CC=F", start_str, end_str)
-
+    return df.sort_index()
 
 def today_utc():
     return dt.datetime.utcnow().date()
 
 def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high = df["High"].astype(float)
-    low = df["Low"].astype(float)
-    close = df["Close"].astype(float)
+    high, low, close = df["High"], df["Low"], df["Close"]
     prev_close = close.shift(1)
     tr = pd.concat([
         (high - low).abs(),
         (high - prev_close).abs(),
         (low - prev_close).abs(),
     ], axis=1).max(axis=1)
-    atr = tr.rolling(period, min_periods=1).mean()
-    return atr
+    return tr.rolling(period, min_periods=1).mean()
 
 def rolling_extrema(series: pd.Series, window: int, mode: str) -> pd.Series:
-    """
-    Mark local highs/lows with a rolling window center.
-    mode: 'max' or 'min'
-    Returns a series with values at pivot points and NaN elsewhere.
-    """
     if window % 2 == 0:
-        window += 1  # enforce odd window
+        window += 1
     half = window // 2
+    roll = series.rolling(window, center=True)
     if mode == "max":
-        roll = series.rolling(window, center=True)
-        is_ext = (series == roll.max())
-        # Require strictly greater than its immediate neighbors to reduce duplicates
-        is_ext &= (series > series.shift(1)) & (series > series.shift(-1))
-        piv = series.where(is_ext)
+        is_ext = (series == roll.max()) & (series > series.shift(1)) & (series > series.shift(-1))
     else:
-        roll = series.rolling(window, center=True)
-        is_ext = (series == roll.min())
-        is_ext &= (series < series.shift(1)) & (series < series.shift(-1))
-        piv = series.where(is_ext)
-    # Drop leading/trailing centers that can't be evaluated
+        is_ext = (series == roll.min()) & (series < series.shift(1)) & (series < series.shift(-1))
+    piv = series.where(is_ext)
     piv.iloc[:half] = np.nan
     piv.iloc[-half:] = np.nan
     return piv
 
 def cluster_levels(level_values: List[float], tol_pct: float = 0.6) -> List[float]:
-    """
-    Merge nearby levels within tol_pct (% of price).
-    Returns sorted unique levels (means of clusters).
-    """
     if not level_values:
         return []
-    level_values = sorted([float(x) for x in level_values if np.isfinite(x)])
+    vals = sorted([float(x) for x in level_values if np.isfinite(x)])
     clusters = []
-    for lv in level_values:
+    for lv in vals:
         if not clusters:
             clusters.append([lv])
         else:
@@ -125,8 +75,7 @@ def cluster_levels(level_values: List[float], tol_pct: float = 0.6) -> List[floa
                 clusters[-1].append(lv)
             else:
                 clusters.append([lv])
-    merged = [float(np.mean(c)) for c in clusters]
-    return merged
+    return [float(np.mean(c)) for c in clusters]
 
 @dataclass
 class SRLevels:
@@ -134,14 +83,10 @@ class SRLevels:
     resistance: List[float]
 
 def detect_sr(df: pd.DataFrame, window: int = 25, cluster_tol_pct: float = 0.6) -> SRLevels:
-    """
-    Detect support/resistance using rolling extrema + clustering.
-    """
     highs = rolling_extrema(df["High"], window, "max").dropna()
     lows = rolling_extrema(df["Low"], window, "min").dropna()
-    res = cluster_levels(list(highs.values), tol_pct=cluster_tol_pct)
-    sup = cluster_levels(list(lows.values), tol_pct=cluster_tol_pct)
-    # Keep only levels within visible price range
+    res = cluster_levels(list(highs.values), cluster_tol_pct)
+    sup = cluster_levels(list(lows.values), cluster_tol_pct)
     lo, hi = float(df["Low"].min()), float(df["High"].max())
     sup = [x for x in sup if lo <= x <= hi]
     res = [x for x in res if lo <= x <= hi]
@@ -151,13 +96,9 @@ def nearest_level(price: float, levels: List[float]) -> Optional[float]:
     if not levels:
         return None
     arr = np.array(levels, dtype=float)
-    idx = np.argmin(np.abs(arr - price))
-    return float(arr[idx])
+    return float(arr[np.argmin(np.abs(arr - price))])
 
 def slope(x: pd.Series, period: int = 50) -> pd.Series:
-    """
-    Simple slope of SMA as trend proxy.
-    """
     sma = x.rolling(period, min_periods=period).mean()
     return sma.diff()
 
@@ -165,117 +106,68 @@ def slope(x: pd.Series, period: int = 50) -> pd.Series:
 class Trade:
     entry_time: pd.Timestamp
     entry_price: float
-    side: str  # 'long' or 'short'
+    side: str
     exit_time: Optional[pd.Timestamp] = None
     exit_price: Optional[float] = None
     pnl_pct: Optional[float] = None
 
-def backtest(
-    df: pd.DataFrame,
-    sr: SRLevels,
-    buffer_pct: float = 0.3,
-    atr_period: int = 14,
-    stop_atr: float = 2.0,
-    take_atr: float = 3.0,
-) -> Tuple[List[Trade], pd.Series]:
-    """
-    Trend-following mean-reversion entry near SR.
-    - Trend up (SMA50 slope > 0): BUY near nearest support (within buffer_pct).
-    - Trend down (SMA50 slope < 0): SHORT near nearest resistance (within buffer_pct).
-    Exits: ATR stop or ATR take-profit (simple).
-    Returns trades list and equity curve (per-trade stepped).
-    """
+def backtest(df: pd.DataFrame, sr: SRLevels,
+             buffer_pct: float = 0.3, atr_period: int = 14,
+             stop_atr: float = 2.0, take_atr: float = 3.0) -> Tuple[List[Trade], pd.Series]:
+
     close = df["Close"].astype(float)
     atr = compute_atr(df, atr_period)
-    trend = slope(close, 50)
-    trades: List[Trade] = []
-    position: Optional[Trade] = None
+    trend = slope(close, 50).reindex(df.index)  # align trend
 
-    equity = [1.0]
-    equity_time = [df.index[0]]
+    trades, equity, equity_time = [], [1.0], [df.index[0]]
+    position = None
 
-    for t, px in close.items():
-        tr_up = (trend.loc[t] or 0) > 0
-        tr_dn = (trend.loc[t] or 0) < 0
-        ns = nearest_level(px, sr.support)
-        nr = nearest_level(px, sr.resistance)
+    for i, (t, px) in enumerate(close.items()):
+        tr_val = float(trend.iloc[i]) if pd.notna(trend.iloc[i]) else 0.0
+        tr_up, tr_dn = tr_val > 0, tr_val < 0
+        ns, nr = nearest_level(px, sr.support), nearest_level(px, sr.resistance)
 
-        # Entry logic (only if flat)
         if position is None:
-            if tr_up and ns is not None and px <= ns * (1 + buffer_pct / 100.0):
-                position = Trade(entry_time=t, entry_price=float(px), side="long")
-                trades.append(position)
-            elif tr_dn and nr is not None and px >= nr * (1 - buffer_pct / 100.0):
-                position = Trade(entry_time=t, entry_price=float(px), side="short")
-                trades.append(position)
+            if tr_up and ns and px <= ns * (1 + buffer_pct / 100.0):
+                position = Trade(t, float(px), "long"); trades.append(position)
+            elif tr_dn and nr and px >= nr * (1 - buffer_pct / 100.0):
+                position = Trade(t, float(px), "short"); trades.append(position)
         else:
-            a = float(atr.loc[t]) if np.isfinite(atr.loc[t]) else 0.0
-            if a <= 0:
-                a = 1e-6  # avoid zero
+            a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else 1e-6
             if position.side == "long":
-                stop = position.entry_price - stop_atr * a
-                take = position.entry_price + take_atr * a
+                stop, take = position.entry_price - stop_atr * a, position.entry_price + take_atr * a
                 if px <= stop or px >= take:
-                    position.exit_time = t
-                    position.exit_price = float(px)
-                    position.pnl_pct = (position.exit_price / position.entry_price - 1) * 100.0
+                    position.exit_time, position.exit_price = t, float(px)
+                    position.pnl_pct = (px / position.entry_price - 1) * 100
+                    equity.append(equity[-1] * (1 + position.pnl_pct / 100)); equity_time.append(t)
                     position = None
-                    equity.append(equity[-1] * (1 + trades[-1].pnl_pct / 100.0))
-                    equity_time.append(t)
             else:
-                stop = position.entry_price + stop_atr * a
-                take = position.entry_price - take_atr * a
+                stop, take = position.entry_price + stop_atr * a, position.entry_price - take_atr * a
                 if px >= stop or px <= take:
-                    position.exit_time = t
-                    position.exit_price = float(px)
-                    position.pnl_pct = (position.entry_price / position.exit_price - 1) * 100.0
+                    position.exit_time, position.exit_price = t, float(px)
+                    position.pnl_pct = (position.entry_price / px - 1) * 100
+                    equity.append(equity[-1] * (1 + position.pnl_pct / 100)); equity_time.append(t)
                     position = None
-                    equity.append(equity[-1] * (1 + trades[-1].pnl_pct / 100.0))
-                    equity_time.append(t)
 
-    # If last trade still open, close at last price
     if position is not None:
-        last_t = close.index[-1]
         last_px = float(close.iloc[-1])
-        if position.side == "long":
-            pnl = (last_px / position.entry_price - 1) * 100.0
-        else:
-            pnl = (position.entry_price / last_px - 1) * 100.0
-        position.exit_time = last_t
-        position.exit_price = last_px
-        position.pnl_pct = pnl
-        equity.append(equity[-1] * (1 + pnl / 100.0))
-        equity_time.append(last_t)
+        pnl = (last_px / position.entry_price - 1) * 100 if position.side == "long" else (position.entry_price / last_px - 1) * 100
+        position.exit_time, position.exit_price, position.pnl_pct = close.index[-1], last_px, pnl
+        equity.append(equity[-1] * (1 + pnl / 100)); equity_time.append(close.index[-1])
 
-    eq = pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index()
-    return trades, eq
+    return trades, pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index()
 
-def max_drawdown(equity: pd.Series) -> float:
-    if equity.empty:
-        return 0.0
-    roll_max = equity.cummax()
-    dd = equity / roll_max - 1.0
-    return float(dd.min() * 100.0)
+def max_drawdown(eq: pd.Series) -> float:
+    if eq.empty: return 0.0
+    return float(((eq / eq.cummax()) - 1).min() * 100)
 
 def summarize_trades(trades: List[Trade]) -> Tuple[float, float]:
-    if not trades:
-        return 0.0, 0.0
     closed = [t for t in trades if t.pnl_pct is not None]
-    if not closed:
-        return 0.0, 0.0
-    wins = [t for t in closed if t.pnl_pct > 0]
-    win_rate = len(wins) / len(closed) * 100.0
-    total_return = 1.0
-    for t in closed:
-        total_return *= (1 + t.pnl_pct / 100.0)
-    total_return = (total_return - 1) * 100.0
-    return float(win_rate), float(total_return)
-
-@st.cache_data(show_spinner=True, ttl=60 * 10)  # cache for 10 minutes
-def fetch_prices(ticker: str, start: dt.date, end: dt.date) -> pd.DataFrame:
-    df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
-    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-    return df
+    if not closed: return 0.0, 0.0
+    win_rate = sum(1 for t in closed if t.pnl_pct > 0) / len(closed) * 100
+    total_ret = 1.0
+    for t in closed: total_ret *= (1 + t.pnl_pct / 100)
+    return win_rate, (total_ret - 1) * 100
 
 # ----------------------------
 # Sidebar Controls
@@ -294,62 +186,30 @@ with st.sidebar:
     take_atr = st.slider("Take Profit (×ATR)", 0.5, 8.0, 3.0, step=0.1)
     refresh = st.button("🔄 Refresh data")
 
-# ----------------------------
-# Data Fetch
-# ----------------------------
 if start_date >= end_date:
-    st.error("Start date must be before end date.")
-    st.stop()
+    st.error("Start date must be before end date."); st.stop()
 
-with st.spinner("Fetching cocoa prices (delayed) …"):
-    if refresh:
-        fetch_prices.clear()
-    prices = fetch_prices(TICKER, start_date, end_date)
+with st.spinner("Fetching cocoa prices…"):
+    prices = get_prices(TICKER, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
 
 if prices.empty:
-    st.warning("No data returned for the selected range.")
-    st.stop()
+    st.warning("No data returned."); st.stop()
 
 # ----------------------------
-# Compute SR, Bias, Backtest
+# Strategy & Metrics
 # ----------------------------
-sr_levels = detect_sr(prices, window=sr_window, cluster_tol_pct=cluster_tol)
-atr = compute_atr(prices, period=atr_period)
-trend_slope = slope(prices["Close"], 50)
-last_close = float(prices["Close"].iloc[-1])
+sr_levels = detect_sr(prices, sr_window, cluster_tol)
+trend_val = slope(prices["Close"], 50).iloc[-1]
+trend_val = float(trend_val) if pd.notna(trend_val) else 0.0
+bias = "LONG" if trend_val > 0 else "SHORT"
 
-ns_price = nearest_level(last_close, sr_levels.support)
-nr_price = nearest_level(last_close, sr_levels.resistance)
+ns_price = nearest_level(float(prices["Close"].iloc[-1]), sr_levels.support)
+nr_price = nearest_level(float(prices["Close"].iloc[-1]), sr_levels.resistance)
 
-# Safely get the last slope value as a float
-last_val = trend_slope.iloc[-1]
-if isinstance(last_val, (pd.Series, pd.DataFrame)):
-    last_val = last_val.squeeze()
-
-try:
-    trend_val = float(last_val)
-except Exception:
-    trend_val = 0.0
-
-trend_up = trend_val > 0
-bias = "LONG" if trend_up else "SHORT"
-
-
-trades, equity = backtest(
-    prices,
-    sr_levels,
-    buffer_pct=buffer_pct,
-    atr_period=atr_period,
-    stop_atr=stop_atr,
-    take_atr=take_atr,
-)
-
+trades, equity = backtest(prices, sr_levels, buffer_pct, atr_period, stop_atr, take_atr)
 win_rate, total_return = summarize_trades(trades)
 mdd = max_drawdown(equity)
 
-# ----------------------------
-# Header Metrics (your desired readout)
-# ----------------------------
 colA, colB, colC, colD, colE, colF = st.columns([1.2, 1, 1, 1, 1, 1.2])
 colA.markdown(f"### 📊 Current Bias: **{bias}**")
 colB.metric("📉 Nearest Support", f"{ns_price:.2f}" if ns_price else "—")
@@ -359,119 +219,28 @@ colE.metric("Total Return", f"{total_return:+.2f}%")
 colF.metric("Max Drawdown", f"{mdd:.2f}%")
 
 # ----------------------------
-# Chart (Plotly Candles + SR + Signals)
+# Chart
 # ----------------------------
 fig = go.Figure()
-
-# Candles
-fig.add_trace(go.Candlestick(
-    x=prices.index,
-    open=prices["Open"],
-    high=prices["High"],
-    low=prices["Low"],
-    close=prices["Close"],
-    name="Price"
-))
-
-# SR lines
+fig.add_trace(go.Candlestick(x=prices.index, open=prices["Open"], high=prices["High"],
+                             low=prices["Low"], close=prices["Close"], name="Price"))
 for lvl in sr_levels.support:
     fig.add_hline(y=lvl, line_width=1, line_dash="dot", line_color="green", opacity=0.5)
 for lvl in sr_levels.resistance:
     fig.add_hline(y=lvl, line_width=1, line_dash="dot", line_color="red", opacity=0.5)
-
-# Trade markers
 long_x, long_y, short_x, short_y, exit_x, exit_y = [], [], [], [], [], []
 for t in trades:
-    if t.side == "long":
-        long_x.append(t.entry_time)
-        long_y.append(t.entry_price)
-    else:
-        short_x.append(t.entry_time)
-        short_y.append(t.entry_price)
-    if t.exit_time is not None and t.exit_price is not None:
-        exit_x.append(t.exit_time)
-        exit_y.append(t.exit_price)
-
-if long_x:
-    fig.add_trace(go.Scatter(
-        x=long_x, y=long_y, mode="markers",
-        name="Buy", marker=dict(symbol="triangle-up", size=10, color="green")
-    ))
-if short_x:
-    fig.add_trace(go.Scatter(
-        x=short_x, y=short_y, mode="markers",
-        name="Sell", marker=dict(symbol="triangle-down", size=10, color="red")
-    ))
-if exit_x:
-    fig.add_trace(go.Scatter(
-        x=exit_x, y=exit_y, mode="markers",
-        name="Exit", marker=dict(symbol="x", size=9, color="gray")
-    ))
-
-# Bias background strip on the last N bars
-N = 100
-x0 = prices.index.max() - pd.Timedelta(days=max(5, min(120, len(prices)//5)))
-bg_color = "rgba(0, 128, 0, 0.07)" if bias == "LONG" else "rgba(220, 20, 60, 0.07)"
-fig.add_vrect(
-    x0=x0, x1=prices.index.max(),
-    fillcolor=bg_color, line_width=0, layer="below"
-)
-
-fig.update_layout(
-    height=700,
-    margin=dict(l=10, r=10, t=30, b=10),
-    xaxis_title=None,
-    yaxis_title="Price",
-    showlegend=True
-)
-
+    if t.side == "long": long_x.append(t.entry_time); long_y.append(t.entry_price)
+    else: short_x.append(t.entry_time); short_y.append(t.entry_price)
+    if t.exit_time and t.exit_price: exit_x.append(t.exit_time); exit_y.append(t.exit_price)
+if long_x: fig.add_trace(go.Scatter(x=long_x, y=long_y, mode="markers", name="Buy",
+                                    marker=dict(symbol="triangle-up", size=10, color="green")))
+if short_x: fig.add_trace(go.Scatter(x=short_x, y=short_y, mode="markers", name="Sell",
+                                     marker=dict(symbol="triangle-down", size=10, color="red")))
+if exit_x: fig.add_trace(go.Scatter(x=exit_x, y=exit_y, mode="markers", name="Exit",
+                                    marker=dict(symbol="x", size=9, color="gray")))
+bg_color = "rgba(0,128,0,0.07)" if bias == "LONG" else "rgba(220,20,60,0.07)"
+fig.add_vrect(x0=prices.index[-min(len(prices), 100)], x1=prices.index.max(),
+              fillcolor=bg_color, line_width=0, layer="below")
+fig.update_layout(height=700, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="Price")
 st.plotly_chart(fig, use_container_width=True)
-
-# ----------------------------
-# Trade Log + Downloads
-# ----------------------------
-closed = [t for t in trades if t.exit_time is not None]
-if closed:
-    log = pd.DataFrame([{
-        "entry_time": t.entry_time, "side": t.side, "entry_price": t.entry_price,
-        "exit_time": t.exit_time, "exit_price": t.exit_price, "pnl_pct": t.pnl_pct
-    } for t in closed]).sort_values("entry_time")
-else:
-    log = pd.DataFrame(columns=["entry_time","side","entry_price","exit_time","exit_price","pnl_pct"])
-
-c1, c2 = st.columns([1, 1])
-with c1:
-    st.subheader("Trade Log")
-    st.dataframe(log, use_container_width=True, height=240)
-with c2:
-    st.subheader("Equity Curve")
-    if not equity.empty:
-        eq_fig = go.Figure()
-        eq_fig.add_trace(go.Scatter(x=equity.index, y=equity.values, mode="lines", name="Equity (×)"))
-        eq_fig.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(eq_fig, use_container_width=True)
-    else:
-        st.write("No closed trades yet for this period/parameters.")
-
-# CSV downloads
-st.download_button(
-    "⬇️ Download Trade Log (CSV)",
-    data=log.to_csv(index=False).encode("utf-8"),
-    file_name="trade_log.csv",
-    mime="text/csv",
-)
-nearest_df = pd.DataFrame({
-    "nearest_support": [ns_price],
-    "nearest_resistance": [nr_price],
-    "bias": [bias],
-    "asof": [pd.Timestamp.utcnow()]
-})
-st.download_button(
-    "⬇️ Download Nearest Levels (CSV)",
-    data=nearest_df.to_csv(index=False).encode("utf-8"),
-    file_name="nearest_levels.csv",
-    mime="text/csv",
-)
-
-# Footer note
-st.caption("Data via Yahoo Finance (delayed ~15m). Strategy is for research only, not financial advice.")
