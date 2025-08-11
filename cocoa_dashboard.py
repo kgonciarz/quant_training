@@ -20,6 +20,40 @@ st.set_page_config(page_title="Cocoa Dashboard", layout="wide", initial_sidebar_
 # ----------------------------
 # Utils
 # ----------------------------
+import pandas as pd
+import yfinance as yf
+
+def get_prices(symbol: str, start: str, end: str) -> pd.DataFrame:
+    df = yf.download(symbol, start=start, end=end, progress=False, auto_adjust=True)
+    if df.empty:
+        raise ValueError(f"No data for {symbol} in range {start} -> {end}")
+
+    # Normalize columns to a flat OHLCV frame
+    if isinstance(df.columns, pd.MultiIndex):
+        # Case 1: columns like ('CC=F','Close'), ('CC=F','Open'), ...
+        if symbol in df.columns.get_level_values(0):
+            df = df.xs(symbol, axis=1, level=0)
+        else:
+            # Case 2: columns like ('Close',''), ('Open','') -> just drop top level
+            df = df.droplevel(0, axis=1)
+
+    # Standardize names
+    rename = {c: c.title() for c in df.columns}
+    df = df.rename(columns=rename)
+
+    # Keep only the usual suspects if present
+    cols = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
+    df = df[cols]
+
+    # Ensure DatetimeIndex and sorted
+    df = df.copy()
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+
+    return df
+prices = get_prices("CC=F", start, end)
+
+
 def today_utc():
     return dt.datetime.utcnow().date()
 
