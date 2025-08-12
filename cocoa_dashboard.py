@@ -160,7 +160,7 @@ class SRLevels:
     support: List[float]
     resistance: List[float]
 
-@st.cache_data(show_spinner=False, ttl=3600)   # cache SR for 1 hour
+
 def detect_sr(df: pd.DataFrame, window: int = 25, cluster_tol_pct: float = 0.6) -> SRLevels:
     highs = rolling_extrema(df["High"], window, "max").dropna()
     lows = rolling_extrema(df["Low"], window, "min").dropna()
