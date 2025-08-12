@@ -197,118 +197,150 @@ def backtest(
     atr_period: int = 14,
     stop_atr: float = 2.0,
     take_atr: float = 3.0,
-    prefer_stop_first: bool = True,   # resolve same-bar stop & take touches
+    debounce_bars: int = 1,             # NEW
+    confirm_mode: str = "none",         # NEW: "none" or "close-confirm"
 ) -> Tuple[List[Trade], pd.Series]:
-    """
-    Entries:
-      - Trend up (SMA50 slope > 0): buy near nearest support (within buffer%).
-      - Trend down (SMA50 slope < 0): short near nearest resistance (within buffer%).
 
-    Exits (more realistic):
-      - Use bar Low/High to check stop/take. If both touched same bar,
-        choose according to `prefer_stop_first`.
-    """
     close = df["Close"].astype(float)
     high  = df["High"].astype(float)
     low   = df["Low"].astype(float)
-
     atr   = compute_atr(df, atr_period)
-    trend = slope(close, 50).reindex(df.index)
+    trend = slope(close, 50).reindex(df.index)  # align
 
     trades: List[Trade] = []
-    equity = [1.0]
-    equity_time = [df.index[0]]
-
+    equity, equity_time = [1.0], [df.index[0]]
     position: Optional[Trade] = None
 
-    for i, t in enumerate(df.index):
-        px = float(close.iloc[i])
-        hi = float(high.iloc[i])
-        lo = float(low.iloc[i])
+    # Debounce state
+    long_touch_count  = 0
+    short_touch_count = 0
+    long_armed  = False   # set true after N consecutive touches near support
+    short_armed = False   # set true after N consecutive touches near resistance
+    last_ns = None
+    last_nr = None
 
+    for i, (t, px) in enumerate(close.items()):
         tr_val = float(trend.iloc[i]) if pd.notna(trend.iloc[i]) else 0.0
         tr_up, tr_dn = tr_val > 0, tr_val < 0
-
         ns = nearest_level(px, sr.support)
         nr = nearest_level(px, sr.resistance)
+        last_ns, last_nr = ns, nr  # keep for confirm step when price moves away
 
-        # Entry (flat only)
+        # Touch conditions (near a level within buffer %)
+        long_touch  = (tr_up and ns is not None and px <= ns * (1 + buffer_pct / 100.0))
+        short_touch = (tr_dn and nr is not None and px >= nr * (1 - buffer_pct / 100.0))
+
+        # Debounce counters (only when flat)
         if position is None:
-            if tr_up and ns is not None and px <= ns * (1 + buffer_pct / 100.0):
-                position = Trade(entry_time=t, entry_price=px, side="long")
-                trades.append(position)
-            elif tr_dn and nr is not None and px >= nr * (1 - buffer_pct / 100.0):
-                position = Trade(entry_time=t, entry_price=px, side="short")
-                trades.append(position)
-            continue
-
-        # Exit (intrabar using bar extremes)
-        a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else 1e-6
-
-        if position.side == "long":
-            stop = position.entry_price - stop_atr * a
-            take = position.entry_price + take_atr * a
-
-            stop_hit = lo <= stop
-            take_hit = hi >= take
-
-            if stop_hit and take_hit:
-                exit_price = stop if prefer_stop_first else take
-            elif stop_hit:
-                exit_price = stop
-            elif take_hit:
-                exit_price = take
+            if long_touch:
+                long_touch_count += 1
             else:
-                exit_price = None
+                long_touch_count = 0
+                long_armed = False
 
-            if exit_price is not None:
-                position.exit_time = t
-                position.exit_price = float(exit_price)
-                position.pnl_pct = (position.exit_price / position.entry_price - 1) * 100.0
-                equity.append(equity[-1] * (1 + position.pnl_pct / 100.0))
-                equity_time.append(t)
-                position = None
-
-        else:  # short
-            stop = position.entry_price + stop_atr * a
-            take = position.entry_price - take_atr * a
-
-            stop_hit = hi >= stop
-            take_hit = lo <= take
-
-            if stop_hit and take_hit:
-                exit_price = stop if prefer_stop_first else take
-            elif stop_hit:
-                exit_price = stop
-            elif take_hit:
-                exit_price = take
+            if short_touch:
+                short_touch_count += 1
             else:
-                exit_price = None
+                short_touch_count = 0
+                short_armed = False
 
-            if exit_price is not None:
-                position.exit_time = t
-                position.exit_price = float(exit_price)
-                position.pnl_pct = (position.entry_price / position.exit_price - 1) * 100.0
-                equity.append(equity[-1] * (1 + position.pnl_pct / 100.0))
-                equity_time.append(t)
-                position = None
+            # Arm after N consecutive touches
+            if long_touch_count >= debounce_bars:
+                long_armed = True
+            if short_touch_count >= debounce_bars:
+                short_armed = True
 
-    # Close any open trade on the final close
+            enter_long = False
+            enter_short = False
+
+            if confirm_mode == "none":
+                # Enter immediately once armed on a touching bar
+                enter_long = long_armed and long_touch
+                enter_short = short_armed and short_touch
+
+            elif confirm_mode == "close-confirm":
+                # Require *subsequent* close moving away from level:
+                # - long: after touches near support, wait for close > support
+                # - short: after touches near resistance, wait for close < resistance
+                if long_armed and ns is not None and px > ns:
+                    enter_long = True
+                if short_armed and nr is not None and px < nr:
+                    enter_short = True
+
+            # Execute entry
+            if position is None and enter_long:
+                position = Trade(t, float(px), "long")
+                trades.append(position)
+                # reset arms/counters
+                long_armed = False
+                long_touch_count = 0
+                short_touch_count = 0
+
+            elif position is None and enter_short:
+                position = Trade(t, float(px), "short")
+                trades.append(position)
+                short_armed = False
+                short_touch_count = 0
+                long_touch_count = 0
+
+        else:
+            # Manage open position using bar extremes (more realistic)
+            a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else 1e-6
+            if position.side == "long":
+                stop = position.entry_price - stop_atr * a
+                take = position.entry_price + take_atr * a
+
+                # Assume stop hits before take when both touched (configurable rule)
+                hit_stop = low.iloc[i]  <= stop
+                hit_take = high.iloc[i] >= take
+
+                if hit_stop or hit_take:
+                    exit_px = stop if hit_stop else take
+                    position.exit_time  = t
+                    position.exit_price = float(exit_px)
+                    position.pnl_pct    = (position.exit_price / position.entry_price - 1) * 100.0
+                    equity.append(equity[-1] * (1 + position.pnl_pct / 100.0))
+                    equity_time.append(t)
+                    position = None
+                    # reset debounce state after exit
+                    long_touch_count = short_touch_count = 0
+                    long_armed = short_armed = False
+
+            else:  # short
+                stop = position.entry_price + stop_atr * a
+                take = position.entry_price - take_atr * a
+
+                hit_stop = high.iloc[i] >= stop
+                hit_take = low.iloc[i]  <= take
+
+                if hit_stop or hit_take:
+                    exit_px = stop if hit_stop else take
+                    position.exit_time  = t
+                    position.exit_price = float(exit_px)
+                    position.pnl_pct    = (position.entry_price / position.exit_price - 1) * 100.0
+                    equity.append(equity[-1] * (1 + position.pnl_pct / 100.0))
+                    equity_time.append(t)
+                    position = None
+                    short_touch_count = long_touch_count = 0
+                    long_armed = short_armed = False
+
+    # Force-close last trade at final close
     if position is not None:
-        last_t = df.index[-1]
+        last_t = close.index[-1]
         last_px = float(close.iloc[-1])
         if position.side == "long":
             pnl = (last_px / position.entry_price - 1) * 100.0
         else:
             pnl = (position.entry_price / last_px - 1) * 100.0
-        position.exit_time = last_t
+        position.exit_time  = last_t
         position.exit_price = last_px
-        position.pnl_pct = pnl
+        position.pnl_pct    = pnl
         equity.append(equity[-1] * (1 + pnl / 100.0))
         equity_time.append(last_t)
 
     eq = pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index()
     return trades, eq
+
 
 
 def max_drawdown(eq: pd.Series) -> float:
@@ -620,6 +652,8 @@ with st.sidebar:
     slippage_bps  = st.slider("Slippage per side (bps)", 0, 50, 5, 1, key="slippage_bps")
     refresh = st.button("🔄 Refresh data")
     optimize_click = st.button("🧪 Optimize (profit ↑ / drawdown ↓)")
+    debounce_bars = st.slider("Debounce bars (hold condition)", 1, 5, 2, 1)
+    confirm_mode  = st.selectbox("Signal confirmation", ["none", "close-confirm"], index=1)
     
 with st.sidebar.expander("🛡️ Overfitting guardrails", expanded=False):
     use_holdout = st.checkbox("Use train/test split (hold-out)", value=True)
@@ -701,6 +735,8 @@ params = {
     "atr_period": atr_period,
     "stop_atr": stop_atr,
     "take_atr": take_atr,
+    "debounce_bars": debounce_bars,
+    "confirm_mode": confirm_mode,
 }
 if "override_params" in st.session_state:
     params.update(st.session_state["override_params"])
@@ -714,6 +750,10 @@ bias        = "LONG" if trend_val > 0 else "SHORT"
 last_close  = float(prices['Close'].iloc[-1])
 ns_price    = nearest_level(last_close, sr_levels.support)
 nr_price    = nearest_level(last_close, sr_levels.resistance)
+# Distance to nearest levels (in % of last price)
+dist_support = None if ns_price is None else (last_close - ns_price) / last_close * 100.0
+dist_resist  = None if nr_price is None else (nr_price - last_close) / last_close * 100.0
+
 
 # --- LIVE SIGNAL ---
 trend_up = trend_val > 0
@@ -744,6 +784,8 @@ trades, equity_step = backtest(
     atr_period=params["atr_period"],
     stop_atr=params["stop_atr"],
     take_atr=params["take_atr"],
+    debounce_bars=params["debounce_bars"],       
+    confirm_mode=params["confirm_mode"],
 )
 
 # Costs-aware summary (you already wired commission_ps & slippage_bps in the sidebar)
@@ -769,6 +811,11 @@ colD.metric("Win Rate", f"{win_rate:.2f}%")
 colE.metric("Total Return (net)", f"{total_return:+.2f}%")
 colF.metric("Max Drawdown", f"{mdd:.2f}%")
 st.caption(f"Sharpe (daily): **{sharpe:.2f}**")
+# Tiny captions showing distance-to-levels
+st.caption(
+    f"Distance: {('—' if dist_support is None else f'{dist_support:+.2f}%')} from support · "
+    f"{('—' if dist_resist  is None else f'{dist_resist:+.2f}%')} from resistance"
+)
 
 st.subheader("Equity Curve (daily)")
 if not equity_daily.empty:
