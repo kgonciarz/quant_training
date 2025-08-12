@@ -21,6 +21,8 @@ st_autorefresh(interval=60000, key="data_refresh")  # 60,000 ms = 60 sec
 # ----------------------------
 # Utilities
 # ----------------------------
+
+@st.cache_data(show_spinner=False, ttl=3600)   # cache for 1 hour
 def get_prices(symbol: str, start, end) -> pd.DataFrame:
     import time
     import datetime as _dt
@@ -144,6 +146,7 @@ class SRLevels:
     support: List[float]
     resistance: List[float]
 
+@st.cache_data(show_spinner=False, ttl=3600)   # cache SR for 1 hour
 def detect_sr(df: pd.DataFrame, window: int = 25, cluster_tol_pct: float = 0.6) -> SRLevels:
     highs = rolling_extrema(df["High"], window, "max").dropna()
     lows = rolling_extrema(df["Low"], window, "min").dropna()
