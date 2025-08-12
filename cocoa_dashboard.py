@@ -420,6 +420,8 @@ with st.sidebar:
     atr_period = st.slider("ATR period", 5, 30, 14)
     stop_atr = st.slider("Stop Loss (×ATR)", 0.5, 5.0, 2.0, step=0.1)
     take_atr = st.slider("Take Profit (×ATR)", 0.5, 8.0, 3.0, step=0.1)
+    commission_ps = st.slider("Commission per side (%)", 0.0, 0.1, 0.02, 0.01, key="commission_ps")
+    slippage_bps  = st.slider("Slippage per side (bps)", 0, 50, 5, 1, key="slippage_bps")
     refresh = st.button("🔄 Refresh data")
     optimize_click = st.button("🧪 Optimize (profit ↑ / drawdown ↓)")
     
