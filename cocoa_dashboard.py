@@ -348,6 +348,82 @@ def summarize_trades(
     total_return_pct = (total_ret - 1.0) * 100.0
     return float(win_rate), float(total_return_pct)
 
+# ---------- Overfitting guardrails: helpers ----------
+
+def equity_daily_from_trades(trades: List[Trade], prices: pd.DataFrame) -> pd.Series:
+    """Build a daily equity line (×) forward-filled between exits."""
+    if not trades:
+        return pd.Series(dtype=float)
+    # start at 1.0 and step on exits
+    steps = [(prices.index[0], 1.0)]
+    eq = 1.0
+    for t in trades:
+        if t.exit_time is None or t.pnl_pct is None:
+            continue
+        eq *= (1 + t.pnl_pct / 100.0)
+        steps.append((pd.to_datetime(t.exit_time), eq))
+    s = pd.Series(dict(steps)).sort_index()
+    # resample to daily and ffill
+    daily = s.resample("1D").ffill()
+    # ensure daily index covers the selected price range
+    idx = pd.date_range(prices.index[0].normalize(),
+                        prices.index[-1].normalize(), freq="D")
+    daily = daily.reindex(idx).ffill()
+    return daily
+
+def sharpe_from_equity_daily(eq_daily: pd.Series, risk_free=0.0) -> float:
+    """Daily Sharpe (simple): mean(daily_ret - rf) / std(daily_ret) * sqrt(252)."""
+    if eq_daily is None or eq_daily.empty or eq_daily.size < 5:
+        return 0.0
+    ret = eq_daily.pct_change().dropna()
+    if ret.std() == 0 or np.isnan(ret.std()):
+        return 0.0
+    return float(((ret - risk_free/252).mean() / ret.std()) * np.sqrt(252))
+
+def perf_summary(prices: pd.DataFrame,
+                 trades: List[Trade],
+                 equity: pd.Series,
+                 commission_pct_per_side: float = 0.0,
+                 slippage_bps_per_side: int = 0) -> dict:
+    """Pack IS metrics + daily Sharpe into one dict (uses your summarize_trades)."""
+    win, net = summarize_trades(
+        trades,
+        commission_pct_per_side=commission_pct_per_side,
+        slippage_bps_per_side=slippage_bps_per_side,
+    )
+    mdd = max_drawdown(equity)
+    eq_daily = equity_daily_from_trades(trades, prices)
+    sharpe = sharpe_from_equity_daily(eq_daily)
+    ntr = len([t for t in trades if t.pnl_pct is not None])
+    return {
+        "win_rate": win,
+        "net": net,
+        "mdd": mdd,
+        "sharpe": sharpe,
+        "trades": ntr,
+        "eq_daily": eq_daily,
+    }
+
+def split_prices(prices: pd.DataFrame, train_ratio: float = 0.7) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Chronological split."""
+    cut = max(5, int(len(prices) * train_ratio))
+    return prices.iloc[:cut].copy(), prices.iloc[cut:].copy()
+
+def timeseries_folds(prices: pd.DataFrame, n_folds: int = 3):
+    """Simple walk-forward generator of (train_df, test_df) tuples."""
+    n = len(prices)
+    if n_folds < 2:
+        yield prices.iloc[: -1], prices.iloc[-1:]
+        return
+    fold_size = n // (n_folds + 1)
+    for k in range(1, n_folds + 1):
+        split = fold_size * k
+        train = prices.iloc[:split].copy()
+        test  = prices.iloc[split: split + fold_size].copy()
+        if len(test) < 5:  # skip tiny tails
+            continue
+        yield train, test
+
 # ---------- Optimizer helpers ----------
 def evaluate_once(prices, sr_window, cluster_tol, buffer_pct, atr_period, stop_atr, take_atr):
     sr = detect_sr(prices, sr_window, cluster_tol)
@@ -362,48 +438,138 @@ def evaluate_once(prices, sr_window, cluster_tol, buffer_pct, atr_period, stop_a
         "trades_list": trades, "equity": equity, "sr_levels": sr
     }
 
-def optimize_params(prices, min_trades=4, dd_penalty=0.7):
-    # Small, fast grid (tweak as you like)
-    sw_opts   = [15, 19, 25, 31]
-    tol_opts  = [0.3, 0.6, 1.0]
-    buf_opts  = [0.2, 0.5, 1.0]
-    atr_opts  = [10, 14, 20]
-    stop_opts = [1.5, 2.0, 2.5]
-    take_opts = [2.0, 3.0, 4.0]
+def _grid_by_breadth(breadth: str):
+    if breadth == "Fast":
+        sw = [19, 25]
+        tol = [0.4, 0.8]
+        buf = [0.3, 0.6]
+        atrp = [10, 14]
+        sl = [1.5, 2.0]
+        tp = [2.5, 3.0]
+    elif breadth == "Wide":
+        sw = [15, 19, 25, 31, 37]
+        tol = [0.3, 0.6, 1.0, 1.2]
+        buf = [0.2, 0.5, 0.8, 1.0]
+        atrp = [10, 14, 18, 22]
+        sl = [1.2, 1.5, 2.0, 2.5]
+        tp = [2.0, 2.5, 3.0, 4.0]
+    else:  # Balanced
+        sw = [19, 25, 31]
+        tol = [0.3, 0.6, 1.0]
+        buf = [0.3, 0.6, 0.9]
+        atrp = [10, 14, 20]
+        sl = [1.5, 2.0, 2.5]
+        tp = [2.5, 3.0, 4.0]
+    return sw, tol, buf, atrp, sl, tp
+
+def optimize_oos(prices: pd.DataFrame,
+                 breadth: str,
+                 dd_penalty: float,
+                 use_holdout: bool,
+                 train_ratio: float,
+                 use_walkforward: bool,
+                 n_folds: int,
+                 min_trades_guard: int,
+                 max_mdd_guard: float,
+                 min_sharpe_guard: float,
+                 commission_pct_per_side: float = 0.0,
+                 slippage_bps_per_side: int = 0):
+    """Optimize parameters on OOS performance with guardrails."""
+    sw_opts, tol_opts, buf_opts, atr_opts, stop_opts, take_opts = _grid_by_breadth(breadth)
 
     rows = []
     best = None
+
+    def score_row(oos_net, oos_mdd, oos_sharpe, ntr):
+        # base score — profit minus DD penalty; reward Sharpe
+        s = oos_net - max(0, oos_mdd) * dd_penalty + 25.0 * oos_sharpe
+        # guards
+        if ntr < min_trades_guard:
+            s -= 100.0
+        if oos_mdd > max_mdd_guard:
+            s -= 100.0
+        if oos_sharpe < min_sharpe_guard:
+            s -= 50.0
+        return s
+
+    # Build folds
+    folds = []
+    if use_walkforward:
+        folds = list(timeseries_folds(prices, n_folds))
+    elif use_holdout:
+        folds = [split_prices(prices, train_ratio)]
+    else:
+        # No OOS; treat entire range as both (not recommended, but keeps code paths simple)
+        folds = [(prices, prices)]
+
     for sw in sw_opts:
         for tol in tol_opts:
-            # compute SR once per (sw, tol) to speed up
-            sr_cache = detect_sr(prices, sw, tol)
+            # SR for each segment (we’ll recompute per segment anyway)
             for buf in buf_opts:
                 for atrp in atr_opts:
                     for sl in stop_opts:
                         for tp in take_opts:
-                            trades, equity = backtest(prices, sr_cache, buf, atrp, sl, tp)
-                            win, net = summarize_trades(trades)
-                            mdd = max_drawdown(equity)
-                            n   = len([t for t in trades if t.pnl_pct is not None])
+                            # accumulate OOS metrics over folds
+                            oos_net_all, oos_mdd_all, oos_sharpe_all, oos_trades_all = [], [], [], []
+                            is_net_all, is_mdd_all, is_sharpe_all = [], [], []
+                            for train_df, test_df in folds:
+                                # In-sample (train) perf
+                                sr_train = detect_sr(train_df, sw, tol)
+                                tr_train, eq_train = backtest(
+                                    train_df, sr_train,
+                                    buffer_pct=buf, atr_period=atrp,
+                                    stop_atr=sl, take_atr=tp
+                                )
+                                is_perf = perf_summary(
+                                    train_df, tr_train, eq_train,
+                                    commission_pct_per_side=commission_pct_per_side,
+                                    slippage_bps_per_side=slippage_bps_per_side,
+                                )
+                                is_net_all.append(is_perf["net"])
+                                is_mdd_all.append(is_perf["mdd"])
+                                is_sharpe_all.append(is_perf["sharpe"])
 
-                            # score: reward profit, penalize drawdown, penalize too few trades
-                            score = (net * 2.0) + (win * 0.5) - (max(0, mdd) * dd_penalty)
-                            if n < min_trades:
-                                score -= 50.0
+                                # Out-of-sample (test) perf
+                                sr_test = detect_sr(test_df, sw, tol)
+                                tr_test, eq_test = backtest(
+                                    test_df, sr_test,
+                                    buffer_pct=buf, atr_period=atrp,
+                                    stop_atr=sl, take_atr=tp
+                                )
+                                oos_perf = perf_summary(
+                                    test_df, tr_test, eq_test,
+                                    commission_pct_per_side=commission_pct_per_side,
+                                    slippage_bps_per_side=slippage_bps_per_side,
+                                )
+                                oos_net_all.append(oos_perf["net"])
+                                oos_mdd_all.append(oos_perf["mdd"])
+                                oos_sharpe_all.append(oos_perf["sharpe"])
+                                oos_trades_all.append(oos_perf["trades"])
 
+                            # average across folds
+                            oos_net = float(np.mean(oos_net_all)) if oos_net_all else 0.0
+                            oos_mdd = float(np.mean(oos_mdd_all)) if oos_mdd_all else 0.0
+                            oos_sharpe = float(np.mean(oos_sharpe_all)) if oos_sharpe_all else 0.0
+                            ntr = int(np.sum(oos_trades_all)) if oos_trades_all else 0
+                            is_net = float(np.mean(is_net_all)) if is_net_all else 0.0
+                            is_mdd = float(np.mean(is_mdd_all)) if is_mdd_all else 0.0
+                            is_sharpe = float(np.mean(is_sharpe_all)) if is_sharpe_all else 0.0
 
+                            s = score_row(oos_net, oos_mdd, oos_sharpe, ntr)
                             row = {
                                 "sr_window": sw, "cluster_tol": tol, "buffer_pct": buf,
                                 "atr_period": atrp, "stop_atr": sl, "take_atr": tp,
-                                "win_rate": win, "net": net, "mdd": mdd, "trades": n,
-                                "score": score
+                                "IS_net": is_net, "IS_mdd": is_mdd, "IS_sharpe": is_sharpe,
+                                "OOS_net": oos_net, "OOS_mdd": oos_mdd, "OOS_sharpe": oos_sharpe,
+                                "OOS_trades": ntr, "score": s
                             }
                             rows.append(row)
-                            if best is None or score > best["score"]:
+                            if best is None or s > best["score"]:
                                 best = row.copy()
 
     grid = pd.DataFrame(rows).sort_values("score", ascending=False)
     return best, grid
+
 
 
 def daily_equity(equity_step: pd.Series, price_index: pd.DatetimeIndex) -> pd.Series:
@@ -455,6 +621,19 @@ with st.sidebar:
     refresh = st.button("🔄 Refresh data")
     optimize_click = st.button("🧪 Optimize (profit ↑ / drawdown ↓)")
     
+with st.sidebar.expander("🛡️ Overfitting guardrails", expanded=False):
+    use_holdout = st.checkbox("Use train/test split (hold-out)", value=True)
+    train_ratio = st.slider("Train ratio", 0.5, 0.9, 0.7, 0.05)
+    use_walkforward = st.checkbox("Use walk-forward CV", value=False)
+    n_folds = st.slider("Walk-forward folds", 2, 6, 3, 1, disabled=not use_walkforward)
+
+    # Search breadth & quality caps
+    min_trades_guard = st.number_input("Min closed trades (OOS)", 0, 100, 6, 1)
+    max_mdd_guard = st.slider("Max drawdown cap (OOS, %)", 0.0, 80.0, 40.0, 1.0)
+    min_sharpe_guard = st.slider("Min daily Sharpe (OOS)", 0.0, 3.0, 0.2, 0.05)
+
+    breadth = st.selectbox("Grid breadth", ["Fast", "Balanced", "Wide"], index=1)
+    dd_penalty = st.slider("Drawdown penalty in score", 0.0, 2.0, 0.7, 0.1)
 
 if start_date >= end_date:
     st.error("Start date must be before end date."); st.stop()
@@ -462,12 +641,32 @@ if start_date >= end_date:
 with st.spinner("Fetching cocoa prices…"):
     prices = get_prices(TICKER, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
 
-# If user wants to apply the optimizer result to the chart
+if optimize_click:
+    with st.spinner("Searching best OOS parameters…"):
+        best, grid = optimize_oos(
+            prices=prices,
+            breadth=breadth,
+            dd_penalty=dd_penalty,
+            use_holdout=use_holdout,
+            train_ratio=train_ratio,
+            use_walkforward=use_walkforward,
+            n_folds=n_folds,
+            min_trades_guard=min_trades_guard,
+            max_mdd_guard=max_mdd_guard,
+            min_sharpe_guard=min_sharpe_guard,
+            commission_pct_per_side=commission_ps,     # ← from your sidebar
+            slippage_bps_per_side=slippage_bps,        # ← from your sidebar
+        )
+    st.session_state["opt_best"] = best
+    st.session_state["opt_grid"] = grid
+    st.success("Optimization done! Showing OOS-scored leaderboard…")
+
+# Show leaderboard + apply button (unique keys to avoid duplicate widget IDs)
 if "opt_best" in st.session_state and st.session_state["opt_best"]:
-    with st.expander("Best parameters found (click 'Apply' to use them)"):
+    with st.expander("Best parameters (OOS-scored) — click 'Apply' to use them"):
         b = st.session_state["opt_best"]
         st.write(pd.DataFrame([b]))
-        if st.button("✅ Apply best params to chart"):
+        if st.button("✅ Apply best params to chart", key="apply_oos"):
             st.session_state["override_params"] = {
                 "sr_window": int(b["sr_window"]),
                 "cluster_tol": float(b["cluster_tol"]),
@@ -477,19 +676,15 @@ if "opt_best" in st.session_state and st.session_state["opt_best"]:
                 "take_atr": float(b["take_atr"]),
             }
             st.rerun()
+    if "opt_grid" in st.session_state and not st.session_state["opt_grid"].empty:
+        st.dataframe(
+            st.session_state["opt_grid"].head(30)[
+                ["sr_window","cluster_tol","buffer_pct","atr_period","stop_atr","take_atr",
+                 "IS_net","IS_mdd","IS_sharpe","OOS_net","OOS_mdd","OOS_sharpe","OOS_trades","score"]
+            ],
+            use_container_width=True
+        )
 
-    # Optional: show top 20 candidates
-    if "opt_grid" in st.session_state:
-        st.dataframe(st.session_state["opt_grid"].head(20), use_container_width=True)
-
-
-# run optimizer
-if optimize_click:
-    with st.spinner("Searching best parameters…"):
-        best, grid = optimize_params(prices)
-    st.session_state["opt_best"] = best
-    st.session_state["opt_grid"] = grid
-    st.success("Optimization done!")
 
 if prices.empty:
     st.warning("No data returned."); st.stop()
