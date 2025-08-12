@@ -520,8 +520,14 @@ trades, equity = backtest(
     stop_atr=params["stop_atr"],
     take_atr=params["take_atr"],
 )
-win_rate, total_return = summarize_trades(trades)
+
+win_rate, total_return = summarize_trades(
+    trades,
+    commission_pct_per_side=commission_ps,
+    slippage_bps_per_side=slippage_bps,
+)
 mdd = max_drawdown(equity)
+
 
 
 colA, colB, colC, colD, colE, colF = st.columns([1.2, 1, 1, 1, 1, 1.2])
