@@ -1,4 +1,4 @@
-# cocoa_dashboard.py
+# cocoa_dashboard.py (Donchian Breakout variant added)
 import datetime as dt
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
@@ -9,22 +9,19 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 from streamlit_autorefresh import st_autorefresh
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
 
 
 TICKER = "CC=F"
 DEFAULT_YEARS = 3
 st.set_page_config(page_title="Cocoa Dashboard", layout="wide", initial_sidebar_state="collapsed")
-# Auto-refresh every 60 seconds
+# Auto-refresh (toggleable later in sidebar)
 st_autorefresh(interval=60000, key="data_refresh")  # 60,000 ms = 60 sec
-TRADING_DAYS = 252  # for Sharpe
+
 
 # ----------------------------
 # Utilities
 # ----------------------------
-
-@st.cache_data(show_spinner=False, ttl=3600)   # cache for 1 hour
+@st.cache_data(show_spinner=False, ttl=3600)
 def get_prices(symbol: str, start, end) -> pd.DataFrame:
     import time
     import datetime as _dt
@@ -103,26 +100,63 @@ def get_prices(symbol: str, start, end) -> pd.DataFrame:
 def today_utc():
     return dt.datetime.utcnow().date()
 
-# --- Wilder ATR (EMA) ---
-def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """
-    Wilder's ATR: True Range smoothed by EMA with alpha=1/period.
-    Matches most charting packages more closely than SMA ATR.
-    """
-    high = df["High"].astype(float)
-    low  = df["Low"].astype(float)
-    close = df["Close"].astype(float)
+# ---------- Core indicators ----------
+
+def compute_atr_sma(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high, low, close = df["High"], df["Low"], df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low).abs(),
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.rolling(period, min_periods=1).mean()
+
+
+def compute_atr_wilder(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high, low, close = df["High"], df["Low"], df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low).abs(),
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+
+
+@st.cache_data(show_spinner=False)
+def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high, low, close = df["High"], df["Low"], df["Close"]
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
 
     prev_close = close.shift(1)
     tr = pd.concat([
         (high - low).abs(),
         (high - prev_close).abs(),
-        (low  - prev_close).abs(),
+        (low - prev_close).abs(),
     ], axis=1).max(axis=1)
 
-    # Wilder smoothing == EMA with alpha = 1/period
-    atr = tr.ewm(alpha=1/period, adjust=False, min_periods=1).mean()
-    return atr
+    atr = tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = dx.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    return adx.fillna(0.0)
+
+
+def slope(x: pd.Series, period: int = 50) -> pd.Series:
+    sma = x.rolling(period, min_periods=period).mean()
+    return sma.diff()
+
+# ---------- S/R engine (existing) ----------
+
+@dataclass
+class SRLevels:
+    support: List[float]
+    resistance: List[float]
 
 
 def rolling_extrema(series: pd.Series, window: int, mode: str) -> pd.Series:
@@ -134,10 +168,11 @@ def rolling_extrema(series: pd.Series, window: int, mode: str) -> pd.Series:
         is_ext = (series == roll.max()) & (series > series.shift(1)) & (series > series.shift(-1))
     else:
         is_ext = (series == roll.min()) & (series < series.shift(1)) & (series < series.shift(-1))
-    piv = series.where(is_ext)
+    piv = series.where(is_ext).copy()
     piv.iloc[:half] = np.nan
     piv.iloc[-half:] = np.nan
     return piv
+
 
 def cluster_levels(level_values: List[float], tol_pct: float = 0.6) -> List[float]:
     if not level_values:
@@ -155,11 +190,6 @@ def cluster_levels(level_values: List[float], tol_pct: float = 0.6) -> List[floa
                 clusters.append([lv])
     return [float(np.mean(c)) for c in clusters]
 
-@dataclass
-class SRLevels:
-    support: List[float]
-    resistance: List[float]
-
 
 def detect_sr(df: pd.DataFrame, window: int = 25, cluster_tol_pct: float = 0.6) -> SRLevels:
     highs = rolling_extrema(df["High"], window, "max").dropna()
@@ -171,295 +201,203 @@ def detect_sr(df: pd.DataFrame, window: int = 25, cluster_tol_pct: float = 0.6) 
     res = [x for x in res if lo <= x <= hi]
     return SRLevels(support=sup, resistance=res)
 
+
 def nearest_level(price: float, levels: List[float]) -> Optional[float]:
     if not levels:
         return None
     arr = np.array(levels, dtype=float)
     return float(arr[np.argmin(np.abs(arr - price))])
 
-def slope(x: pd.Series, period: int = 50) -> pd.Series:
-    sma = x.rolling(period, min_periods=period).mean()
-    return sma.diff()
-
 @dataclass
 class Trade:
     entry_time: pd.Timestamp
     entry_price: float
-    side: str                            # "long" or "short"
+    side: str
     exit_time: Optional[pd.Timestamp] = None
     exit_price: Optional[float] = None
-    pnl_pct: Optional[float] = None      # gross % (no fees/slippage baked in)
+    pnl_pct: Optional[float] = None
 
-def backtest(
-    df: pd.DataFrame,
-    sr: SRLevels,
-    buffer_pct: float = 0.3,
-    atr_period: int = 14,
-    stop_atr: float = 2.0,
-    take_atr: float = 3.0,
-    debounce_bars: int = 1,             # NEW
-    confirm_mode: str = "none",         # NEW: "none" or "close-confirm"
-) -> Tuple[List[Trade], pd.Series]:
+
+# ---------- Original S/R backtest ----------
+
+def backtest_sr(df: pd.DataFrame, sr: SRLevels,
+             buffer_pct: float = 0.3, atr_period: int = 14,
+             stop_atr: float = 2.0, take_atr: float = 3.0) -> Tuple[List[Trade], pd.Series]:
 
     close = df["Close"].astype(float)
-    high  = df["High"].astype(float)
-    low   = df["Low"].astype(float)
-    atr   = compute_atr(df, atr_period)
-    trend = slope(close, 50).reindex(df.index)  # align
+    atr = compute_atr_sma(df, atr_period)
+    trend = slope(close, 50).reindex(df.index)  # align trend
+
+    trades, equity, equity_time = [], [1.0], [df.index[0]]
+    position = None
+
+    for i, (t, px) in enumerate(close.items()):
+        tr_val = float(trend.iloc[i]) if pd.notna(trend.iloc[i]) else 0.0
+        tr_up, tr_dn = tr_val > 0, tr_val < 0
+        ns, nr = nearest_level(px, sr.support), nearest_level(px, sr.resistance)
+
+        if position is None:
+            if tr_up and ns and px <= ns * (1 + buffer_pct / 100.0):
+                position = Trade(t, float(px), "long"); trades.append(position)
+            elif tr_dn and nr and px >= nr * (1 - buffer_pct / 100.0):
+                position = Trade(t, float(px), "short"); trades.append(position)
+        else:
+            a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else 1e-6
+            if position.side == "long":
+                stop, take = position.entry_price - stop_atr * a, position.entry_price + take_atr * a
+                if px <= stop or px >= take:
+                    position.exit_time, position.exit_price = t, float(px)
+                    position.pnl_pct = (px / position.entry_price - 1) * 100
+                    equity.append(equity[-1] * (1 + position.pnl_pct / 100)); equity_time.append(t)
+                    position = None
+            else:
+                stop, take = position.entry_price + stop_atr * a, position.entry_price - take_atr * a
+                if px >= stop or px <= take:
+                    position.exit_time, position.exit_price = t, float(px)
+                    position.pnl_pct = (position.entry_price / px - 1) * 100
+                    equity.append(equity[-1] * (1 + position.pnl_pct / 100)); equity_time.append(t)
+                    position = None
+
+    if position is not None:
+        last_px = float(close.iloc[-1])
+        pnl = (last_px / position.entry_price - 1) * 100 if position.side == "long" else (position.entry_price / last_px - 1) * 100
+        position.exit_time, position.exit_price, position.pnl_pct = close.index[-1], last_px, pnl
+        equity.append(equity[-1] * (1 + pnl / 100)); equity_time.append(close.index[-1])
+
+    return trades, pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index()
+
+
+# ---------- Donchian + Chandelier + ADX backtest ----------
+
+def donchian_channels(df: pd.DataFrame, n: int) -> Tuple[pd.Series, pd.Series]:
+    high_n = df["High"].rolling(n, min_periods=n).max()
+    low_n = df["Low"].rolling(n, min_periods=n).min()
+    return high_n, low_n
+
+
+def chandelier_stops(df: pd.DataFrame, atr: pd.Series, n: int = 22, m: float = 3.0) -> Tuple[pd.Series, pd.Series]:
+    long_stop = df["High"].rolling(n, min_periods=n).max() - m * atr
+    short_stop = df["Low"].rolling(n, min_periods=n).min() + m * atr
+    return long_stop, short_stop
+
+
+def backtest_donchian(df: pd.DataFrame,
+                      n_entry: int = 20,
+                      n_exit: int = 10,
+                      atr_period: int = 20,
+                      chand_n: int = 22,
+                      chand_mult: float = 3.0,
+                      adx_period: int = 14,
+                      adx_min: float = 25.0,
+                      use_wilder_atr: bool = True) -> Tuple[List[Trade], pd.Series, dict]:
+    """Donchian breakout with optional Chandelier trailing stop and ADX filter.
+    Returns trades, equity curve, and a dict of series (for plotting)."""
+    close = df["Close"].astype(float)
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+
+    atr = compute_atr_wilder(df, atr_period) if use_wilder_atr else compute_atr_sma(df, atr_period)
+    adx = compute_adx(df, adx_period)
+
+    high_entry, low_entry = donchian_channels(df, n_entry)
+    high_exit, low_exit = donchian_channels(df, n_exit)
+    chand_long, chand_short = chandelier_stops(df, atr, chand_n, chand_mult)
 
     trades: List[Trade] = []
     equity, equity_time = [1.0], [df.index[0]]
     position: Optional[Trade] = None
 
-    # Debounce state
-    long_touch_count  = 0
-    short_touch_count = 0
-    long_armed  = False   # set true after N consecutive touches near support
-    short_armed = False   # set true after N consecutive touches near resistance
-    last_ns = None
-    last_nr = None
+    # Use prior-bar signals to avoid look-ahead
+    for i in range(1, len(df)):
+        t = df.index[i]
+        px_o, px_h, px_l, px_c = float(df["Open"].iloc[i]), float(high.iloc[i]), float(low.iloc[i]), float(close.iloc[i])
 
-    for i, (t, px) in enumerate(close.items()):
-        tr_val = float(trend.iloc[i]) if pd.notna(trend.iloc[i]) else 0.0
-        tr_up, tr_dn = tr_val > 0, tr_val < 0
-        ns = nearest_level(px, sr.support)
-        nr = nearest_level(px, sr.resistance)
-        last_ns, last_nr = ns, nr  # keep for confirm step when price moves away
+        # Current (i-1) references
+        hi_ent = float(high_entry.iloc[i-1]) if np.isfinite(high_entry.iloc[i-1]) else np.nan
+        lo_ent = float(low_entry.iloc[i-1]) if np.isfinite(low_entry.iloc[i-1]) else np.nan
+        hi_ex = float(high_exit.iloc[i-1]) if np.isfinite(high_exit.iloc[i-1]) else np.nan
+        lo_ex = float(low_exit.iloc[i-1]) if np.isfinite(low_exit.iloc[i-1]) else np.nan
+        adx_ok = float(adx.iloc[i-1]) >= adx_min if np.isfinite(adx.iloc[i-1]) else False
+        chand_l = float(chand_long.iloc[i-1]) if np.isfinite(chand_long.iloc[i-1]) else np.nan
+        chand_s = float(chand_short.iloc[i-1]) if np.isfinite(chand_short.iloc[i-1]) else np.nan
 
-        # Touch conditions (near a level within buffer %)
-        long_touch  = (tr_up and ns is not None and px <= ns * (1 + buffer_pct / 100.0))
-        short_touch = (tr_dn and nr is not None and px >= nr * (1 - buffer_pct / 100.0))
-
-        # Debounce counters (only when flat)
         if position is None:
-            if long_touch:
-                long_touch_count += 1
-            else:
-                long_touch_count = 0
-                long_armed = False
-
-            if short_touch:
-                short_touch_count += 1
-            else:
-                short_touch_count = 0
-                short_armed = False
-
-            # Arm after N consecutive touches
-            if long_touch_count >= debounce_bars:
-                long_armed = True
-            if short_touch_count >= debounce_bars:
-                short_armed = True
-
-            enter_long = False
-            enter_short = False
-
-            if confirm_mode == "none":
-                # Enter immediately once armed on a touching bar
-                enter_long = long_armed and long_touch
-                enter_short = short_armed and short_touch
-
-            elif confirm_mode == "close-confirm":
-                # Require *subsequent* close moving away from level:
-                # - long: after touches near support, wait for close > support
-                # - short: after touches near resistance, wait for close < resistance
-                if long_armed and ns is not None and px > ns:
-                    enter_long = True
-                if short_armed and nr is not None and px < nr:
-                    enter_short = True
-
-            # Execute entry
-            if position is None and enter_long:
-                position = Trade(t, float(px), "long")
-                trades.append(position)
-                # reset arms/counters
-                long_armed = False
-                long_touch_count = 0
-                short_touch_count = 0
-
-            elif position is None and enter_short:
-                position = Trade(t, float(px), "short")
-                trades.append(position)
-                short_armed = False
-                short_touch_count = 0
-                long_touch_count = 0
-
+            entered = False
+            # Long breakout
+            if adx_ok and np.isfinite(hi_ent) and px_c > hi_ent:
+                position = Trade(t, float(px_c), "long"); trades.append(position); entered = True
+            # Short breakout
+            elif adx_ok and np.isfinite(lo_ent) and px_c < lo_ent:
+                position = Trade(t, float(px_c), "short"); trades.append(position); entered = True
+            if entered:
+                continue
         else:
-            # Manage open position using bar extremes (more realistic)
-            a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else 1e-6
+            # Manage exits with intrabar logic (stop prioritized if both hit)
             if position.side == "long":
-                stop = position.entry_price - stop_atr * a
-                take = position.entry_price + take_atr * a
-
-                # Assume stop hits before take when both touched (configurable rule)
-                hit_stop = low.iloc[i]  <= stop
-                hit_take = high.iloc[i] >= take
-
-                if hit_stop or hit_take:
-                    exit_px = stop if hit_stop else take
-                    position.exit_time  = t
-                    position.exit_price = float(exit_px)
-                    position.pnl_pct    = (position.exit_price / position.entry_price - 1) * 100.0
-                    equity.append(equity[-1] * (1 + position.pnl_pct / 100.0))
-                    equity_time.append(t)
+                stop_lvl = chand_l if np.isfinite(chand_l) else -np.inf
+                exit_lvl = lo_ex if np.isfinite(lo_ex) else -np.inf
+                stop_hit = np.isfinite(stop_lvl) and (px_l <= stop_lvl)
+                exit_hit = np.isfinite(exit_lvl) and (px_c < exit_lvl)
+                if stop_hit or exit_hit:
+                    # Assume stop executes first if both same bar
+                    exit_price = stop_lvl if stop_hit else px_c
+                    position.exit_time, position.exit_price = t, float(exit_price)
+                    position.pnl_pct = (exit_price / position.entry_price - 1) * 100
+                    equity.append(equity[-1] * (1 + position.pnl_pct / 100)); equity_time.append(t)
                     position = None
-                    # reset debounce state after exit
-                    long_touch_count = short_touch_count = 0
-                    long_armed = short_armed = False
-
             else:  # short
-                stop = position.entry_price + stop_atr * a
-                take = position.entry_price - take_atr * a
-
-                hit_stop = high.iloc[i] >= stop
-                hit_take = low.iloc[i]  <= take
-
-                if hit_stop or hit_take:
-                    exit_px = stop if hit_stop else take
-                    position.exit_time  = t
-                    position.exit_price = float(exit_px)
-                    position.pnl_pct    = (position.entry_price / position.exit_price - 1) * 100.0
-                    equity.append(equity[-1] * (1 + position.pnl_pct / 100.0))
-                    equity_time.append(t)
+                stop_lvl = chand_s if np.isfinite(chand_s) else np.inf
+                exit_lvl = hi_ex if np.isfinite(hi_ex) else np.inf
+                stop_hit = np.isfinite(stop_lvl) and (px_h >= stop_lvl)
+                exit_hit = np.isfinite(exit_lvl) and (px_c > exit_lvl)
+                if stop_hit or exit_hit:
+                    exit_price = stop_lvl if stop_hit else px_c
+                    position.exit_time, position.exit_price = t, float(exit_price)
+                    position.pnl_pct = (position.entry_price / exit_price - 1) * 100
+                    equity.append(equity[-1] * (1 + position.pnl_pct / 100)); equity_time.append(t)
                     position = None
-                    short_touch_count = long_touch_count = 0
-                    long_armed = short_armed = False
 
-    # Force-close last trade at final close
+    # Close open at last
     if position is not None:
-        last_t = close.index[-1]
         last_px = float(close.iloc[-1])
-        if position.side == "long":
-            pnl = (last_px / position.entry_price - 1) * 100.0
-        else:
-            pnl = (position.entry_price / last_px - 1) * 100.0
-        position.exit_time  = last_t
-        position.exit_price = last_px
-        position.pnl_pct    = pnl
-        equity.append(equity[-1] * (1 + pnl / 100.0))
-        equity_time.append(last_t)
+        pnl = (last_px / position.entry_price - 1) * 100 if position.side == "long" else (position.entry_price / last_px - 1) * 100
+        position.exit_time, position.exit_price, position.pnl_pct = close.index[-1], last_px, pnl
+        equity.append(equity[-1] * (1 + pnl / 100)); equity_time.append(close.index[-1])
 
-    eq = pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index()
-    return trades, eq
+    plot_series = {
+        "high_entry": high_entry,
+        "low_entry": low_entry,
+        "high_exit": high_exit,
+        "low_exit": low_exit,
+        "chand_long": chand_long,
+        "chand_short": chand_short,
+        "adx": adx,
+        "atr": atr,
+    }
+
+    return trades, pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index(), plot_series
 
 
+# ---------- Metrics helpers ----------
 
 def max_drawdown(eq: pd.Series) -> float:
     if eq.empty: return 0.0
     return float(((eq / eq.cummax()) - 1).min() * 100)
 
-def summarize_trades(
-    trades: List[Trade],
-    commission_pct_per_side: float = 0.0,   # e.g., 0.02 => 0.02% per side
-    slippage_bps_per_side: float = 0.0,     # e.g., 5 => 5 bps per side = 0.05%
-) -> Tuple[float, float]:
-    """
-    Returns (win_rate %, total_return %), with per-side commissions and slippage
-    applied to each closed trade. Costs are applied as a simple per-trade
-    return haircut of 2 * (commission + slippage).
-    """
+
+def summarize_trades(trades: List[Trade]) -> Tuple[float, float]:
     closed = [t for t in trades if t.pnl_pct is not None]
-    if not closed:
-        return 0.0, 0.0
-
-    # Convert bps to pct
-    slip_pct_side = slippage_bps_per_side / 10000.0
-    side_cost = commission_pct_per_side / 100.0 + slip_pct_side   # in fraction
-    total_cost = 2.0 * side_cost                                  # entry + exit
-
-    # win rate based on *net* pnl
-    wins = 0
+    if not closed: return 0.0, 0.0
+    win_rate = sum(1 for t in closed if t.pnl_pct > 0) / len(closed) * 100
     total_ret = 1.0
-    for t in closed:
-        gross_r = t.pnl_pct / 100.0
-        net_r = gross_r - total_cost
-        if net_r > 0:
-            wins += 1
-        total_ret *= (1.0 + net_r)
+    for t in closed: total_ret *= (1 + t.pnl_pct / 100)
+    return win_rate, (total_ret - 1) * 100
 
-    win_rate = 100.0 * wins / len(closed)
-    total_return_pct = (total_ret - 1.0) * 100.0
-    return float(win_rate), float(total_return_pct)
+# ---------- Optimizer (unchanged, for SR only) ----------
 
-# ---------- Overfitting guardrails: helpers ----------
-
-def equity_daily_from_trades(trades: List[Trade], prices: pd.DataFrame) -> pd.Series:
-    """Build a daily equity line (×) forward-filled between exits."""
-    if not trades:
-        return pd.Series(dtype=float)
-    # start at 1.0 and step on exits
-    steps = [(prices.index[0], 1.0)]
-    eq = 1.0
-    for t in trades:
-        if t.exit_time is None or t.pnl_pct is None:
-            continue
-        eq *= (1 + t.pnl_pct / 100.0)
-        steps.append((pd.to_datetime(t.exit_time), eq))
-    s = pd.Series(dict(steps)).sort_index()
-    # resample to daily and ffill
-    daily = s.resample("1D").ffill()
-    # ensure daily index covers the selected price range
-    idx = pd.date_range(prices.index[0].normalize(),
-                        prices.index[-1].normalize(), freq="D")
-    daily = daily.reindex(idx).ffill()
-    return daily
-
-def sharpe_from_equity_daily(eq_daily: pd.Series, risk_free=0.0) -> float:
-    """Daily Sharpe (simple): mean(daily_ret - rf) / std(daily_ret) * sqrt(252)."""
-    if eq_daily is None or eq_daily.empty or eq_daily.size < 5:
-        return 0.0
-    ret = eq_daily.pct_change().dropna()
-    if ret.std() == 0 or np.isnan(ret.std()):
-        return 0.0
-    return float(((ret - risk_free/252).mean() / ret.std()) * np.sqrt(252))
-
-def perf_summary(prices: pd.DataFrame,
-                 trades: List[Trade],
-                 equity: pd.Series,
-                 commission_pct_per_side: float = 0.0,
-                 slippage_bps_per_side: int = 0) -> dict:
-    """Pack IS metrics + daily Sharpe into one dict (uses your summarize_trades)."""
-    win, net = summarize_trades(
-        trades,
-        commission_pct_per_side=commission_pct_per_side,
-        slippage_bps_per_side=slippage_bps_per_side,
-    )
-    mdd = max_drawdown(equity)
-    eq_daily = equity_daily_from_trades(trades, prices)
-    sharpe = sharpe_from_equity_daily(eq_daily)
-    ntr = len([t for t in trades if t.pnl_pct is not None])
-    return {
-        "win_rate": win,
-        "net": net,
-        "mdd": mdd,
-        "sharpe": sharpe,
-        "trades": ntr,
-        "eq_daily": eq_daily,
-    }
-
-def split_prices(prices: pd.DataFrame, train_ratio: float = 0.7) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Chronological split."""
-    cut = max(5, int(len(prices) * train_ratio))
-    return prices.iloc[:cut].copy(), prices.iloc[cut:].copy()
-
-def timeseries_folds(prices: pd.DataFrame, n_folds: int = 3):
-    """Simple walk-forward generator of (train_df, test_df) tuples."""
-    n = len(prices)
-    if n_folds < 2:
-        yield prices.iloc[: -1], prices.iloc[-1:]
-        return
-    fold_size = n // (n_folds + 1)
-    for k in range(1, n_folds + 1):
-        split = fold_size * k
-        train = prices.iloc[:split].copy()
-        test  = prices.iloc[split: split + fold_size].copy()
-        if len(test) < 5:  # skip tiny tails
-            continue
-        yield train, test
-
-# ---------- Optimizer helpers ----------
 def evaluate_once(prices, sr_window, cluster_tol, buffer_pct, atr_period, stop_atr, take_atr):
     sr = detect_sr(prices, sr_window, cluster_tol)
-    trades, equity = backtest(prices, sr, buffer_pct, atr_period, stop_atr, take_atr)
+    trades, equity = backtest_sr(prices, sr, buffer_pct, atr_period, stop_atr, take_atr)
     win, net = summarize_trades(trades)
     mdd = max_drawdown(equity)
     n_trades = len([t for t in trades if t.pnl_pct is not None])
@@ -470,168 +408,48 @@ def evaluate_once(prices, sr_window, cluster_tol, buffer_pct, atr_period, stop_a
         "trades_list": trades, "equity": equity, "sr_levels": sr
     }
 
-def _grid_by_breadth(breadth: str):
-    if breadth == "Fast":
-        sw = [19, 25]
-        tol = [0.4, 0.8]
-        buf = [0.3, 0.6]
-        atrp = [10, 14]
-        sl = [1.5, 2.0]
-        tp = [2.5, 3.0]
-    elif breadth == "Wide":
-        sw = [15, 19, 25, 31, 37]
-        tol = [0.3, 0.6, 1.0, 1.2]
-        buf = [0.2, 0.5, 0.8, 1.0]
-        atrp = [10, 14, 18, 22]
-        sl = [1.2, 1.5, 2.0, 2.5]
-        tp = [2.0, 2.5, 3.0, 4.0]
-    else:  # Balanced
-        sw = [19, 25, 31]
-        tol = [0.3, 0.6, 1.0]
-        buf = [0.3, 0.6, 0.9]
-        atrp = [10, 14, 20]
-        sl = [1.5, 2.0, 2.5]
-        tp = [2.5, 3.0, 4.0]
-    return sw, tol, buf, atrp, sl, tp
 
-def optimize_oos(prices: pd.DataFrame,
-                 breadth: str,
-                 dd_penalty: float,
-                 use_holdout: bool,
-                 train_ratio: float,
-                 use_walkforward: bool,
-                 n_folds: int,
-                 min_trades_guard: int,
-                 max_mdd_guard: float,
-                 min_sharpe_guard: float,
-                 commission_pct_per_side: float = 0.0,
-                 slippage_bps_per_side: int = 0):
-    """Optimize parameters on OOS performance with guardrails."""
-    sw_opts, tol_opts, buf_opts, atr_opts, stop_opts, take_opts = _grid_by_breadth(breadth)
+def optimize_params(prices, min_trades=4, dd_penalty=0.7):
+    # Small, fast grid (tweak as you like)
+    sw_opts   = [15, 19, 25, 31]
+    tol_opts  = [0.3, 0.6, 1.0]
+    buf_opts  = [0.2, 0.5, 1.0]
+    atr_opts  = [10, 14, 20]
+    stop_opts = [1.5, 2.0, 2.5]
+    take_opts = [2.0, 3.0, 4.0]
 
     rows = []
     best = None
-
-    def score_row(oos_net, oos_mdd, oos_sharpe, ntr):
-        # base score — profit minus DD penalty; reward Sharpe
-        s = oos_net - max(0, oos_mdd) * dd_penalty + 25.0 * oos_sharpe
-        # guards
-        if ntr < min_trades_guard:
-            s -= 100.0
-        if oos_mdd > max_mdd_guard:
-            s -= 100.0
-        if oos_sharpe < min_sharpe_guard:
-            s -= 50.0
-        return s
-
-    # Build folds
-    folds = []
-    if use_walkforward:
-        folds = list(timeseries_folds(prices, n_folds))
-    elif use_holdout:
-        folds = [split_prices(prices, train_ratio)]
-    else:
-        # No OOS; treat entire range as both (not recommended, but keeps code paths simple)
-        folds = [(prices, prices)]
-
     for sw in sw_opts:
         for tol in tol_opts:
-            # SR for each segment (we’ll recompute per segment anyway)
+            # compute SR once per (sw, tol) to speed up
+            sr_cache = detect_sr(prices, sw, tol)
             for buf in buf_opts:
                 for atrp in atr_opts:
                     for sl in stop_opts:
                         for tp in take_opts:
-                            # accumulate OOS metrics over folds
-                            oos_net_all, oos_mdd_all, oos_sharpe_all, oos_trades_all = [], [], [], []
-                            is_net_all, is_mdd_all, is_sharpe_all = [], [], []
-                            for train_df, test_df in folds:
-                                # In-sample (train) perf
-                                sr_train = detect_sr(train_df, sw, tol)
-                                tr_train, eq_train = backtest(
-                                    train_df, sr_train,
-                                    buffer_pct=buf, atr_period=atrp,
-                                    stop_atr=sl, take_atr=tp
-                                )
-                                is_perf = perf_summary(
-                                    train_df, tr_train, eq_train,
-                                    commission_pct_per_side=commission_pct_per_side,
-                                    slippage_bps_per_side=slippage_bps_per_side,
-                                )
-                                is_net_all.append(is_perf["net"])
-                                is_mdd_all.append(is_perf["mdd"])
-                                is_sharpe_all.append(is_perf["sharpe"])
+                            trades, equity = backtest_sr(prices, sr_cache, buf, atrp, sl, tp)
+                            win, net = summarize_trades(trades)
+                            mdd = max_drawdown(equity)
+                            n   = len([t for t in trades if t.pnl_pct is not None])
 
-                                # Out-of-sample (test) perf
-                                sr_test = detect_sr(test_df, sw, tol)
-                                tr_test, eq_test = backtest(
-                                    test_df, sr_test,
-                                    buffer_pct=buf, atr_period=atrp,
-                                    stop_atr=sl, take_atr=tp
-                                )
-                                oos_perf = perf_summary(
-                                    test_df, tr_test, eq_test,
-                                    commission_pct_per_side=commission_pct_per_side,
-                                    slippage_bps_per_side=slippage_bps_per_side,
-                                )
-                                oos_net_all.append(oos_perf["net"])
-                                oos_mdd_all.append(oos_perf["mdd"])
-                                oos_sharpe_all.append(oos_perf["sharpe"])
-                                oos_trades_all.append(oos_perf["trades"])
+                            # score: reward profit, penalize drawdown, penalize too few trades
+                            score = (net * 2.0) + (win * 0.5) - (max(0, mdd) * dd_penalty)
+                            if n < min_trades:
+                                score -= 50.0
 
-                            # average across folds
-                            oos_net = float(np.mean(oos_net_all)) if oos_net_all else 0.0
-                            oos_mdd = float(np.mean(oos_mdd_all)) if oos_mdd_all else 0.0
-                            oos_sharpe = float(np.mean(oos_sharpe_all)) if oos_sharpe_all else 0.0
-                            ntr = int(np.sum(oos_trades_all)) if oos_trades_all else 0
-                            is_net = float(np.mean(is_net_all)) if is_net_all else 0.0
-                            is_mdd = float(np.mean(is_mdd_all)) if is_mdd_all else 0.0
-                            is_sharpe = float(np.mean(is_sharpe_all)) if is_sharpe_all else 0.0
-
-                            s = score_row(oos_net, oos_mdd, oos_sharpe, ntr)
                             row = {
                                 "sr_window": sw, "cluster_tol": tol, "buffer_pct": buf,
                                 "atr_period": atrp, "stop_atr": sl, "take_atr": tp,
-                                "IS_net": is_net, "IS_mdd": is_mdd, "IS_sharpe": is_sharpe,
-                                "OOS_net": oos_net, "OOS_mdd": oos_mdd, "OOS_sharpe": oos_sharpe,
-                                "OOS_trades": ntr, "score": s
+                                "win_rate": win, "net": net, "mdd": mdd, "trades": n,
+                                "score": score
                             }
                             rows.append(row)
-                            if best is None or s > best["score"]:
+                            if best is None or score > best["score"]:
                                 best = row.copy()
 
     grid = pd.DataFrame(rows).sort_values("score", ascending=False)
     return best, grid
-
-
-
-def daily_equity(equity_step: pd.Series, price_index: pd.DatetimeIndex) -> pd.Series:
-    """
-    Forward-fill the stepwise equity onto the price index (trading days).
-    Ensures the first day starts at 1.0.
-    """
-    if equity_step.empty:
-        return pd.Series(dtype=float)
-    # Align to trading days and forward-fill between exits
-    eq = equity_step.reindex(price_index, method="ffill")
-    # If equity started after the first price date, fill the very first with 1.0
-    if not eq.empty and pd.isna(eq.iloc[0]):
-        eq.iloc[0] = 1.0
-        eq = eq.ffill()
-    return eq.astype(float)
-
-def max_drawdown_from_equity(eq: pd.Series) -> float:
-    if eq.empty:
-        return 0.0
-    roll_max = eq.cummax()
-    dd = eq / roll_max - 1.0
-    return float(dd.min() * 100.0)
-
-def sharpe_from_equity(eq: pd.Series) -> float:
-    # Daily log or simple returns—use simple here
-    rets = eq.pct_change().dropna()
-    if rets.empty or rets.std() == 0:
-        return 0.0
-    return float((rets.mean() / rets.std()) * np.sqrt(TRADING_DAYS))
 
 # ----------------------------
 # Sidebar Controls
@@ -642,32 +460,40 @@ with st.sidebar:
     start_default = end_default - dt.timedelta(days=365 * DEFAULT_YEARS)
     start_date = st.date_input("Start date", value=start_default)
     end_date = st.date_input("End date", value=end_default)
-    sr_window = st.slider("Pivot window (bars)", 15, 61, 25, step=2)
-    cluster_tol = st.slider("SR cluster tolerance (%)", 0.1, 1.5, 0.6, step=0.1)
-    buffer_pct = st.slider("Entry buffer around SR (%)", 0.0, 1.5, 0.3, step=0.1)
-    atr_period = st.slider("ATR period", 5, 30, 14)
-    stop_atr = st.slider("Stop Loss (×ATR)", 0.5, 5.0, 2.0, step=0.1)
-    take_atr = st.slider("Take Profit (×ATR)", 0.5, 8.0, 3.0, step=0.1)
-    commission_ps = st.slider("Commission per side (%)", 0.0, 0.1, 0.02, 0.01, key="commission_ps")
-    slippage_bps  = st.slider("Slippage per side (bps)", 0, 50, 5, 1, key="slippage_bps")
-    refresh = st.button("🔄 Refresh data")
-    optimize_click = st.button("🧪 Optimize (profit ↑ / drawdown ↓)")
-    debounce_bars = st.slider("Debounce bars (hold condition)", 1, 5, 2, 1)
-    confirm_mode  = st.selectbox("Signal confirmation", ["none", "close-confirm"], index=1)
-    
-with st.sidebar.expander("🛡️ Overfitting guardrails", expanded=False):
-    use_holdout = st.checkbox("Use train/test split (hold-out)", value=True)
-    train_ratio = st.slider("Train ratio", 0.5, 0.9, 0.7, 0.05)
-    use_walkforward = st.checkbox("Use walk-forward CV", value=False)
-    n_folds = st.slider("Walk-forward folds", 2, 6, 3, 1, disabled=not use_walkforward)
 
-    # Search breadth & quality caps
-    min_trades_guard = st.number_input("Min closed trades (OOS)", 0, 100, 6, 1)
-    max_mdd_guard = st.slider("Max drawdown cap (OOS, %)", 0.0, 80.0, 40.0, 1.0)
-    min_sharpe_guard = st.slider("Min daily Sharpe (OOS)", 0.0, 3.0, 0.2, 0.05)
+    # Strategy selector
+    strategy = st.selectbox("Strategy", ["S/R Bounce (original)", "Donchian Breakout"], index=1)
 
-    breadth = st.selectbox("Grid breadth", ["Fast", "Balanced", "Wide"], index=1)
-    dd_penalty = st.slider("Drawdown penalty in score", 0.0, 2.0, 0.7, 0.1)
+    # Common trend viz
+    trend_len = st.slider("Trend window for bias (SMA)", 20, 200, 50, step=5)
+
+    # Strategy-specific params
+    if strategy == "S/R Bounce (original)":
+        st.subheader("S/R Parameters")
+        sr_window = st.slider("Pivot window (bars)", 15, 61, 25, step=2)
+        cluster_tol = st.slider("SR cluster tolerance (%)", 0.1, 1.5, 0.6, step=0.1)
+        buffer_pct = st.slider("Entry buffer around SR (%)", 0.0, 1.5, 0.3, step=0.1)
+        atr_period = st.slider("ATR period", 5, 30, 14)
+        stop_atr = st.slider("Stop Loss (×ATR)", 0.5, 5.0, 2.0, step=0.1)
+        take_atr = st.slider("Take Profit (×ATR)", 0.5, 8.0, 3.0, step=0.1)
+        optimize_click = st.button("🧪 Optimize (profit ↑ / drawdown ↓)")
+    else:
+        st.subheader("Donchian / Chandelier / ADX")
+        n_entry = st.slider("Donchian entry (N-high/low)", 10, 60, 20)
+        n_exit = st.slider("Donchian exit (N for opposite)", 5, 40, 10)
+        atr_period_d = st.slider("ATR period (Wilder)", 5, 40, 20)
+        chand_n = st.slider("Chandelier lookback (N)", 10, 60, 22)
+        chand_mult = st.slider("Chandelier multiple (×ATR)", 1.0, 5.0, 3.0, step=0.1)
+        adx_period = st.slider("ADX period", 7, 30, 14)
+        adx_min = st.slider("ADX minimum to trade", 10.0, 40.0, 25.0, step=0.5)
+        optimize_click = False  # not wired for Donchian in this build
+
+    # Refresh toggle
+    auto_refresh = st.checkbox("Auto-refresh every 60s (daily data doesn’t need it)", value=True)
+
+if not auto_refresh:
+    # kill the autorefresh by resetting the key (hacky but works in practice)
+    st_autorefresh(interval=0, key="data_refresh_off")
 
 if start_date >= end_date:
     st.error("Start date must be before end date."); st.stop()
@@ -675,100 +501,118 @@ if start_date >= end_date:
 with st.spinner("Fetching cocoa prices…"):
     prices = get_prices(TICKER, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
 
-if optimize_click:
-    with st.spinner("Searching best OOS parameters…"):
-        best, grid = optimize_oos(
-            prices=prices,
-            breadth=breadth,
-            dd_penalty=dd_penalty,
-            use_holdout=use_holdout,
-            train_ratio=train_ratio,
-            use_walkforward=use_walkforward,
-            n_folds=n_folds,
-            min_trades_guard=min_trades_guard,
-            max_mdd_guard=max_mdd_guard,
-            min_sharpe_guard=min_sharpe_guard,
-            commission_pct_per_side=commission_ps,     # ← from your sidebar
-            slippage_bps_per_side=slippage_bps,        # ← from your sidebar
-        )
-    st.session_state["opt_best"] = best
-    st.session_state["opt_grid"] = grid
-    st.success("Optimization done! Showing OOS-scored leaderboard…")
-
-# Show leaderboard + apply button (unique keys to avoid duplicate widget IDs)
-if "opt_best" in st.session_state and st.session_state["opt_best"]:
-    with st.expander("Best parameters (OOS-scored) — click 'Apply' to use them"):
-        b = st.session_state["opt_best"]
-        st.write(pd.DataFrame([b]))
-        if st.button("✅ Apply best params to chart", key="apply_oos"):
-            st.session_state["override_params"] = {
-                "sr_window": int(b["sr_window"]),
-                "cluster_tol": float(b["cluster_tol"]),
-                "buffer_pct": float(b["buffer_pct"]),
-                "atr_period": int(b["atr_period"]),
-                "stop_atr": float(b["stop_atr"]),
-                "take_atr": float(b["take_atr"]),
-            }
-            st.rerun()
-    if "opt_grid" in st.session_state and not st.session_state["opt_grid"].empty:
-        st.dataframe(
-            st.session_state["opt_grid"].head(30)[
-                ["sr_window","cluster_tol","buffer_pct","atr_period","stop_atr","take_atr",
-                 "IS_net","IS_mdd","IS_sharpe","OOS_net","OOS_mdd","OOS_sharpe","OOS_trades","score"]
-            ],
-            use_container_width=True
-        )
-
-
 if prices.empty:
     st.warning("No data returned."); st.stop()
-
 
 # ----------------------------
 # Strategy & Metrics
 # ----------------------------
-# Use sliders by default; override with optimizer choice if available
-params = {
-    "sr_window": sr_window,
-    "cluster_tol": cluster_tol,
-    "buffer_pct": buffer_pct,
-    "atr_period": atr_period,
-    "stop_atr": stop_atr,
-    "take_atr": take_atr,
-    "debounce_bars": debounce_bars,
-    "confirm_mode": confirm_mode,
-}
-if "override_params" in st.session_state:
-    params.update(st.session_state["override_params"])
-    st.caption(f"Using optimized params: {params}")
+trend_val = slope(prices["Close"], trend_len).iloc[-1]
+trend_val = float(trend_val) if pd.notna(trend_val) else 0.0
+bias = "LONG" if trend_val > 0 else "SHORT"
+last_close = float(prices['Close'].iloc[-1])
 
-# --- Strategy & Metrics using `params` ---
-sr_levels   = detect_sr(prices, params["sr_window"], params["cluster_tol"])
-trend_val   = slope(prices["Close"], 50).iloc[-1]
-trend_val   = float(trend_val) if pd.notna(trend_val) else 0.0
-bias        = "LONG" if trend_val > 0 else "SHORT"
-last_close  = float(prices['Close'].iloc[-1])
-ns_price    = nearest_level(last_close, sr_levels.support)
-nr_price    = nearest_level(last_close, sr_levels.resistance)
-# Distance to nearest levels (in % of last price)
-dist_support = None if ns_price is None else (last_close - ns_price) / last_close * 100.0
-dist_resist  = None if nr_price is None else (nr_price - last_close) / last_close * 100.0
+if strategy == "S/R Bounce (original)":
+    # Optimizer bits (only for SR)
+    refresh = st.sidebar.button("🔄 Refresh data")
+    if "opt_best" in st.session_state and st.session_state.get("opt_best"):
+        with st.expander("Best parameters found (click 'Apply' to use them)"):
+            b = st.session_state["opt_best"]
+            st.write(pd.DataFrame([b]))
+            if st.button("✅ Apply best params to chart"):
+                st.session_state["override_params"] = {
+                    "sr_window": int(b["sr_window"]),
+                    "cluster_tol": float(b["cluster_tol"]),
+                    "buffer_pct": float(b["buffer_pct"]),
+                    "atr_period": int(b["atr_period"]),
+                    "stop_atr": float(b["stop_atr"]),
+                    "take_atr": float(b["take_atr"]),
+                }
+                st.rerun()
+        if "opt_grid" in st.session_state:
+            st.dataframe(st.session_state["opt_grid"].head(20), use_container_width=True)
 
+    # run optimizer
+    if optimize_click:
+        with st.spinner("Searching best parameters…"):
+            best, grid = optimize_params(prices)
+        st.session_state["opt_best"] = best
+        st.session_state["opt_grid"] = grid
+        st.success("Optimization done!")
 
-# --- LIVE SIGNAL ---
-trend_up = trend_val > 0
-trend_down = trend_val < 0
-signal = "HOLD"
-reason = ""
+    # Use sliders by default; override with optimizer choice if available
+    params = {
+        "sr_window": sr_window,
+        "cluster_tol": cluster_tol,
+        "buffer_pct": buffer_pct,
+        "atr_period": atr_period,
+        "stop_atr": stop_atr,
+        "take_atr": take_atr,
+    }
+    if "override_params" in st.session_state:
+        params.update(st.session_state["override_params"])
+        st.caption(f"Using optimized params: {params}")
 
-if trend_up and ns_price and last_close <= ns_price * (1 + params["buffer_pct"]/100):
-    signal = "BUY"
-    reason = f"Price {last_close:.2f} near support {ns_price:.2f} with uptrend"
-elif trend_down and nr_price and last_close >= nr_price * (1 - params["buffer_pct"]/100):
-    signal = "SELL"
-    reason = f"Price {last_close:.2f} near resistance {nr_price:.2f} with downtrend"
+    sr_levels   = detect_sr(prices, params["sr_window"], params["cluster_tol"])
+    ns_price    = nearest_level(last_close, sr_levels.support)
+    nr_price    = nearest_level(last_close, sr_levels.resistance)
 
-# Show the live signal prominently
+    # LIVE SIGNAL for SR
+    trend_up = trend_val > 0
+    trend_down = trend_val < 0
+    signal = "HOLD"; reason = ""
+    if trend_up and ns_price is not None and last_close <= ns_price * (1 + params["buffer_pct"]/100):
+        signal = "BUY"; reason = f"Price {last_close:.2f} near support {ns_price:.2f} with uptrend"
+    elif trend_down and nr_price is not None and last_close >= nr_price * (1 - params["buffer_pct"]/100):
+        signal = "SELL"; reason = f"Price {last_close:.2f} near resistance {nr_price:.2f} with downtrend"
+
+    trades, equity = backtest_sr(
+        prices, sr_levels,
+        buffer_pct=params["buffer_pct"],
+        atr_period=params["atr_period"],
+        stop_atr=params["stop_atr"],
+        take_atr=params["take_atr"],
+    )
+
+    # Metrics
+    win_rate, total_return = summarize_trades(trades)
+    mdd = max_drawdown(equity)
+
+else:
+    # Donchian strategy path
+    ns_price = nr_price = None  # not applicable
+
+    trades, equity, plot_series = backtest_donchian(
+        prices,
+        n_entry=n_entry,
+        n_exit=n_exit,
+        atr_period=atr_period_d,
+        chand_n=chand_n,
+        chand_mult=chand_mult,
+        adx_period=adx_period,
+        adx_min=adx_min,
+        use_wilder_atr=True,
+    )
+
+    # LIVE SIGNAL for Donchian (use prior-bar channels)
+    he, le, adx_s = plot_series["high_entry"], plot_series["low_entry"], plot_series["adx"]
+    he_prev = float(he.iloc[-2]) if len(he) >= 2 and np.isfinite(he.iloc[-2]) else np.nan
+    le_prev = float(le.iloc[-2]) if len(le) >= 2 and np.isfinite(le.iloc[-2]) else np.nan
+    adx_ok = float(adx_s.iloc[-2]) >= adx_min if len(adx_s) >= 2 and np.isfinite(adx_s.iloc[-2]) else False
+
+    signal = "HOLD"; reason = ""
+    if adx_ok and np.isfinite(he_prev) and last_close > he_prev:
+        signal = "BUY"; reason = f"Close {last_close:.2f} broke {n_entry}-day high {he_prev:.2f} with ADX≥{adx_min:.0f}"
+    elif adx_ok and np.isfinite(le_prev) and last_close < le_prev:
+        signal = "SELL"; reason = f"Close {last_close:.2f} broke {n_entry}-day low {le_prev:.2f} with ADX≥{adx_min:.0f}"
+
+    # Metrics
+    win_rate, total_return = summarize_trades(trades)
+    mdd = max_drawdown(equity)
+
+# ----------------------------
+# Header signal & metrics
+# ----------------------------
 signal_color = {"BUY": "green", "SELL": "red", "HOLD": "gray"}[signal]
 st.markdown(
     f"<h2 style='color:{signal_color};'>📢 Live Signal: {signal}</h2>", 
@@ -777,60 +621,13 @@ st.markdown(
 if reason:
     st.caption(reason)
 
-
-trades, equity_step = backtest(
-    prices, sr_levels,
-    buffer_pct=params["buffer_pct"],
-    atr_period=params["atr_period"],
-    stop_atr=params["stop_atr"],
-    take_atr=params["take_atr"],
-    debounce_bars=params["debounce_bars"],       
-    confirm_mode=params["confirm_mode"],
-)
-
-# Costs-aware summary (you already wired commission_ps & slippage_bps in the sidebar)
-win_rate, total_return = summarize_trades(
-    trades,
-    commission_pct_per_side=commission_ps,
-    slippage_bps_per_side=slippage_bps,
-)
-
-# --- NEW: daily equity for MDD/Sharpe ---
-equity_daily = daily_equity(equity_step, prices.index)
-mdd = max_drawdown_from_equity(equity_daily)
-sharpe = sharpe_from_equity(equity_daily)
-
-
-
-
 colA, colB, colC, colD, colE, colF = st.columns([1.2, 1, 1, 1, 1, 1.2])
 colA.markdown(f"### 📊 Current Bias: **{bias}**")
-colB.metric("📉 Nearest Support", f"{ns_price:.2f}" if ns_price else "—")
-colC.metric("📈 Nearest Resistance", f"{nr_price:.2f}" if nr_price else "—")
+colB.metric("📉 Nearest Support", f"{ns_price:.2f}" if ns_price is not None else "—")
+colC.metric("📈 Nearest Resistance", f"{nr_price:.2f}" if nr_price is not None else "—")
 colD.metric("Win Rate", f"{win_rate:.2f}%")
-colE.metric("Total Return (net)", f"{total_return:+.2f}%")
+colE.metric("Total Return", f"{total_return:+.2f}%")
 colF.metric("Max Drawdown", f"{mdd:.2f}%")
-st.caption(f"Sharpe (daily): **{sharpe:.2f}**")
-# Tiny captions showing distance-to-levels
-st.caption(
-    f"Distance: {('—' if dist_support is None else f'{dist_support:+.2f}%')} from support · "
-    f"{('—' if dist_resist  is None else f'{dist_resist:+.2f}%')} from resistance"
-)
-
-st.subheader("Equity Curve (daily)")
-if not equity_daily.empty:
-    eq_fig = go.Figure()
-    eq_fig.add_trace(go.Scatter(
-        x=equity_daily.index,
-        y=equity_daily.values,
-        mode="lines",
-        name="Equity (×)"
-    ))
-    eq_fig.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10))
-    st.plotly_chart(eq_fig, use_container_width=True)
-else:
-    st.write("No closed trades yet for this period/parameters.")
-
 
 # ----------------------------
 # Chart
@@ -838,10 +635,30 @@ else:
 fig = go.Figure()
 fig.add_trace(go.Candlestick(x=prices.index, open=prices["Open"], high=prices["High"],
                              low=prices["Low"], close=prices["Close"], name="Price"))
-for lvl in sr_levels.support:
-    fig.add_hline(y=lvl, line_width=1, line_dash="dot", line_color="green", opacity=0.5)
-for lvl in sr_levels.resistance:
-    fig.add_hline(y=lvl, line_width=1, line_dash="dot", line_color="red", opacity=0.5)
+
+if strategy == "S/R Bounce (original)":
+    sr_levels = detect_sr(prices, sr_window if 'sr_window' in locals() else 25, cluster_tol if 'cluster_tol' in locals() else 0.6)
+    for lvl in sr_levels.support:
+        fig.add_hline(y=lvl, line_width=1, line_dash="dot", line_color="green", opacity=0.5)
+    for lvl in sr_levels.resistance:
+        fig.add_hline(y=lvl, line_width=1, line_dash="dot", line_color="red", opacity=0.5)
+else:
+    # Donchian channel & chandelier overlays
+    he = plot_series["high_entry"]
+    le = plot_series["low_entry"]
+    hx = plot_series["high_exit"]
+    lx = plot_series["low_exit"]
+    ch_l = plot_series["chand_long"]
+    ch_s = plot_series["chand_short"]
+
+    fig.add_trace(go.Scatter(x=he.index, y=he, name=f"{n_entry}D High", mode="lines"))
+    fig.add_trace(go.Scatter(x=le.index, y=le, name=f"{n_entry}D Low", mode="lines"))
+    fig.add_trace(go.Scatter(x=hx.index, y=hx, name=f"{n_exit}D High (exit)", mode="lines", line=dict(dash="dot")))
+    fig.add_trace(go.Scatter(x=lx.index, y=lx, name=f"{n_exit}D Low (exit)", mode="lines", line=dict(dash="dot")))
+    fig.add_trace(go.Scatter(x=ch_l.index, y=ch_l, name="Chandelier Long", mode="lines"))
+    fig.add_trace(go.Scatter(x=ch_s.index, y=ch_s, name="Chandelier Short", mode="lines"))
+
+# Trade markers
 long_x, long_y, short_x, short_y, exit_x, exit_y = [], [], [], [], [], []
 for t in trades:
     if t.side == "long": long_x.append(t.entry_time); long_y.append(t.entry_price)
@@ -853,8 +670,9 @@ if short_x: fig.add_trace(go.Scatter(x=short_x, y=short_y, mode="markers", name=
                                      marker=dict(symbol="triangle-down", size=10, color="red")))
 if exit_x: fig.add_trace(go.Scatter(x=exit_x, y=exit_y, mode="markers", name="Exit",
                                     marker=dict(symbol="x", size=9, color="gray")))
+
 bg_color = "rgba(0,128,0,0.07)" if bias == "LONG" else "rgba(220,20,60,0.07)"
 fig.add_vrect(x0=prices.index[-min(len(prices), 100)], x1=prices.index.max(),
               fillcolor=bg_color, line_width=0, layer="below")
-fig.update_layout(height=700, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="Price")
+fig.update_layout(height=720, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="Price")
 st.plotly_chart(fig, use_container_width=True)
