@@ -9,6 +9,8 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 from streamlit_autorefresh import st_autorefresh
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
 
 
 TICKER = "CC=F"
@@ -101,15 +103,27 @@ def get_prices(symbol: str, start, end) -> pd.DataFrame:
 def today_utc():
     return dt.datetime.utcnow().date()
 
+# --- Wilder ATR (EMA) ---
 def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high, low, close = df["High"], df["Low"], df["Close"]
+    """
+    Wilder's ATR: True Range smoothed by EMA with alpha=1/period.
+    Matches most charting packages more closely than SMA ATR.
+    """
+    high = df["High"].astype(float)
+    low  = df["Low"].astype(float)
+    close = df["Close"].astype(float)
+
     prev_close = close.shift(1)
     tr = pd.concat([
         (high - low).abs(),
         (high - prev_close).abs(),
-        (low - prev_close).abs(),
+        (low  - prev_close).abs(),
     ], axis=1).max(axis=1)
-    return tr.rolling(period, min_periods=1).mean()
+
+    # Wilder smoothing == EMA with alpha = 1/period
+    atr = tr.ewm(alpha=1/period, adjust=False, min_periods=1).mean()
+    return atr
+
 
 def rolling_extrema(series: pd.Series, window: int, mode: str) -> pd.Series:
     if window % 2 == 0:
@@ -171,68 +185,169 @@ def slope(x: pd.Series, period: int = 50) -> pd.Series:
 class Trade:
     entry_time: pd.Timestamp
     entry_price: float
-    side: str
+    side: str                            # "long" or "short"
     exit_time: Optional[pd.Timestamp] = None
     exit_price: Optional[float] = None
-    pnl_pct: Optional[float] = None
+    pnl_pct: Optional[float] = None      # gross % (no fees/slippage baked in)
 
-def backtest(df: pd.DataFrame, sr: SRLevels,
-             buffer_pct: float = 0.3, atr_period: int = 14,
-             stop_atr: float = 2.0, take_atr: float = 3.0) -> Tuple[List[Trade], pd.Series]:
+def backtest(
+    df: pd.DataFrame,
+    sr: SRLevels,
+    buffer_pct: float = 0.3,
+    atr_period: int = 14,
+    stop_atr: float = 2.0,
+    take_atr: float = 3.0,
+    prefer_stop_first: bool = True,   # resolve same-bar stop & take touches
+) -> Tuple[List[Trade], pd.Series]:
+    """
+    Entries:
+      - Trend up (SMA50 slope > 0): buy near nearest support (within buffer%).
+      - Trend down (SMA50 slope < 0): short near nearest resistance (within buffer%).
 
+    Exits (more realistic):
+      - Use bar Low/High to check stop/take. If both touched same bar,
+        choose according to `prefer_stop_first`.
+    """
     close = df["Close"].astype(float)
-    atr = compute_atr(df, atr_period)
-    trend = slope(close, 50).reindex(df.index)  # align trend
+    high  = df["High"].astype(float)
+    low   = df["Low"].astype(float)
 
-    trades, equity, equity_time = [], [1.0], [df.index[0]]
-    position = None
+    atr   = compute_atr(df, atr_period)
+    trend = slope(close, 50).reindex(df.index)
 
-    for i, (t, px) in enumerate(close.items()):
+    trades: List[Trade] = []
+    equity = [1.0]
+    equity_time = [df.index[0]]
+
+    position: Optional[Trade] = None
+
+    for i, t in enumerate(df.index):
+        px = float(close.iloc[i])
+        hi = float(high.iloc[i])
+        lo = float(low.iloc[i])
+
         tr_val = float(trend.iloc[i]) if pd.notna(trend.iloc[i]) else 0.0
         tr_up, tr_dn = tr_val > 0, tr_val < 0
-        ns, nr = nearest_level(px, sr.support), nearest_level(px, sr.resistance)
 
+        ns = nearest_level(px, sr.support)
+        nr = nearest_level(px, sr.resistance)
+
+        # Entry (flat only)
         if position is None:
-            if tr_up and ns and px <= ns * (1 + buffer_pct / 100.0):
-                position = Trade(t, float(px), "long"); trades.append(position)
-            elif tr_dn and nr and px >= nr * (1 - buffer_pct / 100.0):
-                position = Trade(t, float(px), "short"); trades.append(position)
-        else:
-            a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else 1e-6
-            if position.side == "long":
-                stop, take = position.entry_price - stop_atr * a, position.entry_price + take_atr * a
-                if px <= stop or px >= take:
-                    position.exit_time, position.exit_price = t, float(px)
-                    position.pnl_pct = (px / position.entry_price - 1) * 100
-                    equity.append(equity[-1] * (1 + position.pnl_pct / 100)); equity_time.append(t)
-                    position = None
+            if tr_up and ns is not None and px <= ns * (1 + buffer_pct / 100.0):
+                position = Trade(entry_time=t, entry_price=px, side="long")
+                trades.append(position)
+            elif tr_dn and nr is not None and px >= nr * (1 - buffer_pct / 100.0):
+                position = Trade(entry_time=t, entry_price=px, side="short")
+                trades.append(position)
+            continue
+
+        # Exit (intrabar using bar extremes)
+        a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else 1e-6
+
+        if position.side == "long":
+            stop = position.entry_price - stop_atr * a
+            take = position.entry_price + take_atr * a
+
+            stop_hit = lo <= stop
+            take_hit = hi >= take
+
+            if stop_hit and take_hit:
+                exit_price = stop if prefer_stop_first else take
+            elif stop_hit:
+                exit_price = stop
+            elif take_hit:
+                exit_price = take
             else:
-                stop, take = position.entry_price + stop_atr * a, position.entry_price - take_atr * a
-                if px >= stop or px <= take:
-                    position.exit_time, position.exit_price = t, float(px)
-                    position.pnl_pct = (position.entry_price / px - 1) * 100
-                    equity.append(equity[-1] * (1 + position.pnl_pct / 100)); equity_time.append(t)
-                    position = None
+                exit_price = None
 
+            if exit_price is not None:
+                position.exit_time = t
+                position.exit_price = float(exit_price)
+                position.pnl_pct = (position.exit_price / position.entry_price - 1) * 100.0
+                equity.append(equity[-1] * (1 + position.pnl_pct / 100.0))
+                equity_time.append(t)
+                position = None
+
+        else:  # short
+            stop = position.entry_price + stop_atr * a
+            take = position.entry_price - take_atr * a
+
+            stop_hit = hi >= stop
+            take_hit = lo <= take
+
+            if stop_hit and take_hit:
+                exit_price = stop if prefer_stop_first else take
+            elif stop_hit:
+                exit_price = stop
+            elif take_hit:
+                exit_price = take
+            else:
+                exit_price = None
+
+            if exit_price is not None:
+                position.exit_time = t
+                position.exit_price = float(exit_price)
+                position.pnl_pct = (position.entry_price / position.exit_price - 1) * 100.0
+                equity.append(equity[-1] * (1 + position.pnl_pct / 100.0))
+                equity_time.append(t)
+                position = None
+
+    # Close any open trade on the final close
     if position is not None:
+        last_t = df.index[-1]
         last_px = float(close.iloc[-1])
-        pnl = (last_px / position.entry_price - 1) * 100 if position.side == "long" else (position.entry_price / last_px - 1) * 100
-        position.exit_time, position.exit_price, position.pnl_pct = close.index[-1], last_px, pnl
-        equity.append(equity[-1] * (1 + pnl / 100)); equity_time.append(close.index[-1])
+        if position.side == "long":
+            pnl = (last_px / position.entry_price - 1) * 100.0
+        else:
+            pnl = (position.entry_price / last_px - 1) * 100.0
+        position.exit_time = last_t
+        position.exit_price = last_px
+        position.pnl_pct = pnl
+        equity.append(equity[-1] * (1 + pnl / 100.0))
+        equity_time.append(last_t)
 
-    return trades, pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index()
+    eq = pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index()
+    return trades, eq
+
 
 def max_drawdown(eq: pd.Series) -> float:
     if eq.empty: return 0.0
     return float(((eq / eq.cummax()) - 1).min() * 100)
 
-def summarize_trades(trades: List[Trade]) -> Tuple[float, float]:
+def summarize_trades(
+    trades: List[Trade],
+    commission_pct_per_side: float = 0.0,   # e.g., 0.02 => 0.02% per side
+    slippage_bps_per_side: float = 0.0,     # e.g., 5 => 5 bps per side = 0.05%
+) -> Tuple[float, float]:
+    """
+    Returns (win_rate %, total_return %), with per-side commissions and slippage
+    applied to each closed trade. Costs are applied as a simple per-trade
+    return haircut of 2 * (commission + slippage).
+    """
     closed = [t for t in trades if t.pnl_pct is not None]
-    if not closed: return 0.0, 0.0
-    win_rate = sum(1 for t in closed if t.pnl_pct > 0) / len(closed) * 100
+    if not closed:
+        return 0.0, 0.0
+
+    # Convert bps to pct
+    slip_pct_side = slippage_bps_per_side / 10000.0
+    side_cost = commission_pct_per_side / 100.0 + slip_pct_side   # in fraction
+    total_cost = 2.0 * side_cost                                  # entry + exit
+
+    # win rate based on *net* pnl
+    wins = 0
     total_ret = 1.0
-    for t in closed: total_ret *= (1 + t.pnl_pct / 100)
-    return win_rate, (total_ret - 1) * 100
+    for t in closed:
+        gross_r = t.pnl_pct / 100.0
+        net_r = gross_r - total_cost
+        if net_r > 0:
+            wins += 1
+        total_ret *= (1.0 + net_r)
+
+    win_rate = 100.0 * wins / len(closed)
+    total_return_pct = (total_ret - 1.0) * 100.0
+    return float(win_rate), float(total_return_pct)
+
 # ---------- Optimizer helpers ----------
 def evaluate_once(prices, sr_window, cluster_tol, buffer_pct, atr_period, stop_atr, take_atr):
     sr = detect_sr(prices, sr_window, cluster_tol)
@@ -307,6 +422,30 @@ with st.sidebar:
     take_atr = st.slider("Take Profit (×ATR)", 0.5, 8.0, 3.0, step=0.1)
     refresh = st.button("🔄 Refresh data")
     optimize_click = st.button("🧪 Optimize (profit ↑ / drawdown ↓)")
+    commission_pct_per_side=commission_ps,
+    slippage_bps_per_side=slippage_bps,
+
+with st.sidebar:
+    commission_ps = st.slider("Commission per side (%)", 0.0, 0.1, 0.02, 0.01)
+    slippage_bps  = st.slider("Slippage per side (bps)", 0, 50, 5, 1)
+
+# --- Backtest ---
+trades, equity = backtest(
+    prices, sr_levels,
+    buffer_pct=params["buffer_pct"],
+    atr_period=params["atr_period"],
+    stop_atr=params["stop_atr"],
+    take_atr=params["take_atr"],
+)
+
+# --- Summary with costs ---
+win_rate, total_return = summarize_trades(
+    trades,
+    commission_pct_per_side=commission_ps,
+    slippage_bps_per_side=slippage_bps,
+)
+mdd = max_drawdown(equity)
+
 
 if start_date >= end_date:
     st.error("Start date must be before end date."); st.stop()
