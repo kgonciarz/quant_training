@@ -422,9 +422,7 @@ with st.sidebar:
     take_atr = st.slider("Take Profit (×ATR)", 0.5, 8.0, 3.0, step=0.1)
     refresh = st.button("🔄 Refresh data")
     optimize_click = st.button("🧪 Optimize (profit ↑ / drawdown ↓)")
-    commission_pct_per_side=commission_ps,
-    slippage_bps_per_side=slippage_bps
-
+    
 
 if start_date >= end_date:
     st.error("Start date must be before end date."); st.stop()
