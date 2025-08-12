@@ -18,7 +18,7 @@ DEFAULT_YEARS = 3
 st.set_page_config(page_title="Cocoa Dashboard", layout="wide", initial_sidebar_state="collapsed")
 # Auto-refresh every 60 seconds
 st_autorefresh(interval=60000, key="data_refresh")  # 60,000 ms = 60 sec
-
+TRADING_DAYS = 252  # for Sharpe
 
 # ----------------------------
 # Utilities
@@ -405,6 +405,36 @@ def optimize_params(prices, min_trades=4, dd_penalty=0.7):
     grid = pd.DataFrame(rows).sort_values("score", ascending=False)
     return best, grid
 
+
+def daily_equity(equity_step: pd.Series, price_index: pd.DatetimeIndex) -> pd.Series:
+    """
+    Forward-fill the stepwise equity onto the price index (trading days).
+    Ensures the first day starts at 1.0.
+    """
+    if equity_step.empty:
+        return pd.Series(dtype=float)
+    # Align to trading days and forward-fill between exits
+    eq = equity_step.reindex(price_index, method="ffill")
+    # If equity started after the first price date, fill the very first with 1.0
+    if not eq.empty and pd.isna(eq.iloc[0]):
+        eq.iloc[0] = 1.0
+        eq = eq.ffill()
+    return eq.astype(float)
+
+def max_drawdown_from_equity(eq: pd.Series) -> float:
+    if eq.empty:
+        return 0.0
+    roll_max = eq.cummax()
+    dd = eq / roll_max - 1.0
+    return float(dd.min() * 100.0)
+
+def sharpe_from_equity(eq: pd.Series) -> float:
+    # Daily log or simple returns—use simple here
+    rets = eq.pct_change().dropna()
+    if rets.empty or rets.std() == 0:
+        return 0.0
+    return float((rets.mean() / rets.std()) * np.sqrt(TRADING_DAYS))
+
 # ----------------------------
 # Sidebar Controls
 # ----------------------------
@@ -513,7 +543,7 @@ if reason:
     st.caption(reason)
 
 
-trades, equity = backtest(
+trades, equity_step = backtest(
     prices, sr_levels,
     buffer_pct=params["buffer_pct"],
     atr_period=params["atr_period"],
@@ -521,12 +551,18 @@ trades, equity = backtest(
     take_atr=params["take_atr"],
 )
 
+# Costs-aware summary (you already wired commission_ps & slippage_bps in the sidebar)
 win_rate, total_return = summarize_trades(
     trades,
     commission_pct_per_side=commission_ps,
     slippage_bps_per_side=slippage_bps,
 )
-mdd = max_drawdown(equity)
+
+# --- NEW: daily equity for MDD/Sharpe ---
+equity_daily = daily_equity(equity_step, prices.index)
+mdd = max_drawdown_from_equity(equity_daily)
+sharpe = sharpe_from_equity(equity_daily)
+
 
 
 
@@ -535,8 +571,24 @@ colA.markdown(f"### 📊 Current Bias: **{bias}**")
 colB.metric("📉 Nearest Support", f"{ns_price:.2f}" if ns_price else "—")
 colC.metric("📈 Nearest Resistance", f"{nr_price:.2f}" if nr_price else "—")
 colD.metric("Win Rate", f"{win_rate:.2f}%")
-colE.metric("Total Return", f"{total_return:+.2f}%")
+colE.metric("Total Return (net)", f"{total_return:+.2f}%")
 colF.metric("Max Drawdown", f"{mdd:.2f}%")
+st.caption(f"Sharpe (daily): **{sharpe:.2f}**")
+
+st.subheader("Equity Curve (daily)")
+if not equity_daily.empty:
+    eq_fig = go.Figure()
+    eq_fig.add_trace(go.Scatter(
+        x=equity_daily.index,
+        y=equity_daily.values,
+        mode="lines",
+        name="Equity (×)"
+    ))
+    eq_fig.update_layout(height=240, margin=dict(l=10, r=10, t=10, b=10))
+    st.plotly_chart(eq_fig, use_container_width=True)
+else:
+    st.write("No closed trades yet for this period/parameters.")
+
 
 # ----------------------------
 # Chart
