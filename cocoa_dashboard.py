@@ -8,10 +8,15 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+from streamlit_autorefresh import st_autorefresh
+
 
 TICKER = "CC=F"
 DEFAULT_YEARS = 3
 st.set_page_config(page_title="Cocoa Dashboard", layout="wide", initial_sidebar_state="collapsed")
+# Auto-refresh every 60 seconds
+st_autorefresh(interval=60000, key="data_refresh")  # 60,000 ms = 60 sec
+
 
 # ----------------------------
 # Utilities
@@ -363,6 +368,29 @@ bias        = "LONG" if trend_val > 0 else "SHORT"
 last_close  = float(prices['Close'].iloc[-1])
 ns_price    = nearest_level(last_close, sr_levels.support)
 nr_price    = nearest_level(last_close, sr_levels.resistance)
+
+# --- LIVE SIGNAL ---
+trend_up = trend_val > 0
+trend_down = trend_val < 0
+signal = "HOLD"
+reason = ""
+
+if trend_up and ns_price and last_close <= ns_price * (1 + params["buffer_pct"]/100):
+    signal = "BUY"
+    reason = f"Price {last_close:.2f} near support {ns_price:.2f} with uptrend"
+elif trend_down and nr_price and last_close >= nr_price * (1 - params["buffer_pct"]/100):
+    signal = "SELL"
+    reason = f"Price {last_close:.2f} near resistance {nr_price:.2f} with downtrend"
+
+# Show the live signal prominently
+signal_color = {"BUY": "green", "SELL": "red", "HOLD": "gray"}[signal]
+st.markdown(
+    f"<h2 style='color:{signal_color};'>📢 Live Signal: {signal}</h2>", 
+    unsafe_allow_html=True
+)
+if reason:
+    st.caption(reason)
+
 
 trades, equity = backtest(
     prices, sr_levels,
