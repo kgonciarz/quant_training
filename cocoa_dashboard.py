@@ -589,7 +589,7 @@ st.plotly_chart(fig, use_container_width=True)
 # =============================
 # pages/☕ Coffee Dashboard.py
 # (Place this file in a `pages/` folder next to cocoa_dashboard.py)
-# Same app, but for Coffee futures (KC=F)
+# Same app, but for Coffee futures (KC=F). IMPORTANT: no set_page_config here.
 # =============================
 import datetime as dt
 from dataclasses import dataclass
@@ -605,7 +605,7 @@ from streamlit_autorefresh import st_autorefresh
 TICKER = "KC=F"  # Coffee
 DEFAULT_YEARS = 3
 
-st.set_page_config(page_title="Coffee Dashboard", layout="wide", initial_sidebar_state="collapsed")
+# Do NOT call st.set_page_config here to avoid conflicts in multipage apps.
 st_autorefresh(interval=60000, key="data_refresh_coffee")
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -842,12 +842,8 @@ elif (not long_only) and np.isfinite(le_prev) and adx_ok and last_close < le_pre
     signal, reason = "SELL", f"Close {last_close:.2f} < {n_entry}-day low {le_prev:.2f}" + (f" (ADX≥{adx_min:.0f})" if use_adx else "")
 
 # ---- Display ----
-wr, net, n_tr = (lambda ts: (
-    (sum(1 for t in ts if t.pnl_pct is not None and t.pnl_pct > 0) / max(1, sum(1 for t in ts if t.pnl_pct is not None))) * 100 if any(t.pnl_pct is not None for t in ts) else 0.0,
-    (np.prod([1 + t.pnl_pct/100 for t in ts if t.pnl_pct is not None]) - 1) * 100 if any(t.pnl_pct is not None for t in ts) else 0.0,
-    sum(1 for t in ts if t.pnl_pct is not None)
-))(trades)
-
+wr = (sum(1 for t in trades if t.pnl_pct is not None and t.pnl_pct > 0) / max(1, sum(1 for t in trades if t.pnl_pct is not None))) * 100 if any(t.pnl_pct is not None for t in trades) else 0.0
+net = (np.prod([1 + t.pnl_pct/100 for t in trades if t.pnl_pct is not None]) - 1) * 100 if any(t.pnl_pct is not None for t in trades) else 0.0
 mdd = float(((equity / equity.cummax()) - 1).min() * 100) if len(equity) else 0.0
 
 signal_color = {"BUY":"green","SELL":"red","HOLD":"gray"}[signal]
