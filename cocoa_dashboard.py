@@ -423,28 +423,7 @@ with st.sidebar:
     refresh = st.button("🔄 Refresh data")
     optimize_click = st.button("🧪 Optimize (profit ↑ / drawdown ↓)")
     commission_pct_per_side=commission_ps,
-    slippage_bps_per_side=slippage_bps,
-
-with st.sidebar:
-    commission_ps = st.slider("Commission per side (%)", 0.0, 0.1, 0.02, 0.01)
-    slippage_bps  = st.slider("Slippage per side (bps)", 0, 50, 5, 1)
-
-# --- Backtest ---
-trades, equity = backtest(
-    prices, sr_levels,
-    buffer_pct=params["buffer_pct"],
-    atr_period=params["atr_period"],
-    stop_atr=params["stop_atr"],
-    take_atr=params["take_atr"],
-)
-
-# --- Summary with costs ---
-win_rate, total_return = summarize_trades(
-    trades,
-    commission_pct_per_side=commission_ps,
-    slippage_bps_per_side=slippage_bps,
-)
-mdd = max_drawdown(equity)
+    slippage_bps_per_side=slippage_bps
 
 
 if start_date >= end_date:
