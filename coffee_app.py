@@ -489,69 +489,89 @@ else:
     elif trend_down and nr_price is not None and last_close >= nr_price * (1 - buffer_pct/100):
         signal = "SELL"; reason = f"Price {last_close:.2f} near resistance {nr_price:.2f} with downtrend"
 
-    # Simple SR backtest (from your original)
-    def backtest_sr(df: pd.DataFrame, sr: SRLevels, buffer_pct: float = 0.3, atr_period: int = 14, stop_atr: float = 2.0, take_atr: float = 3.0, stop_pct: float | None = 10.0):
-        close = df["Close"].astype(float)
-        high  = df["High"].astype(float)     # <-- NEW
-        low   = df["Low"].astype(float)      # <-- NEW
-        atr = compute_atr_sma(df, atr_period)
-        trend = slope(close, 50).reindex(df.index)
+def backtest_sr(
+    df: pd.DataFrame,
+    sr: "SRLevels",
+    buffer_pct: float = 0.3,
+    atr_period: int = 14,
+    stop_atr: float = 2.0,
+    take_atr: float = 3.0,
+    stop_pct: Optional[float] = 10.0,   # hard stop in %
+) -> Tuple[List[Trade], pd.Series]:
+    close = df["Close"].astype(float)
+    high  = df["High"].astype(float)
+    low   = df["Low"].astype(float)
+    atr = compute_atr_sma(df, atr_period)
+    trend = slope(close, 50).reindex(df.index)
 
-        trades, equity, equity_time = [], [1.0], [df.index[0]]; position=None
-        for i, (t, px) in enumerate(close.items()):
-            tr_val = float(trend.iloc[i]) if pd.notna(trend.iloc[i]) else 0.0
-            tr_up, tr_dn = tr_val > 0, tr_val < 0
-            ns, nr = nearest_level(px, sr.support), nearest_level(px, sr.resistance)
-            if position is None:
-                if tr_up and ns and px <= ns * (1 + buffer_pct / 100.0): position = Trade(t, float(px), "long"); trades.append(position)
-                elif tr_dn and nr and px >= nr * (1 - buffer_pct / 100.0): position = Trade(t, float(px), "short"); trades.append(position)
-            else:
-    a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else 1e-6
+    trades: List[Trade] = []
+    equity, equity_time = [1.0], [df.index[0]]
+    position: Optional[Trade] = None
 
-    # ----- GLOBAL HARD STOP (priority 1) -----
-    if stop_pct is not None:
-        if position.side == "long":
-            hard_stop = position.entry_price * (1.0 - stop_pct / 100.0)
-            if float(low.iloc[i]) <= hard_stop:  # intrabar check
-                position.exit_time, position.exit_price = t, float(hard_stop)
-                position.pnl_pct = (hard_stop / position.entry_price - 1) * 100
-                equity.append(equity[-1] * (1 + position.pnl_pct / 100)); equity_time.append(t)
-                position = None
-                continue
+    for i, (t, px) in enumerate(close.items()):
+        tr_val = float(trend.iloc[i]) if pd.notna(trend.iloc[i]) else 0.0
+        tr_up, tr_dn = tr_val > 0, tr_val < 0
+        ns = nearest_level(px, sr.support)
+        nr = nearest_level(px, sr.resistance)
+
+        if position is None:
+            if tr_up and ns and px <= ns * (1 + buffer_pct / 100.0):
+                position = Trade(t, float(px), "long"); trades.append(position)
+            elif tr_dn and nr and px >= nr * (1 - buffer_pct / 100.0):
+                position = Trade(t, float(px), "short"); trades.append(position)
         else:
-            hard_stop = position.entry_price * (1.0 + stop_pct / 100.0)
-            if float(high.iloc[i]) >= hard_stop:
-                position.exit_time, position.exit_price = t, float(hard_stop)
-                position.pnl_pct = (position.entry_price / hard_stop - 1) * 100
-                equity.append(equity[-1] * (1 + position.pnl_pct / 100)); equity_time.append(t)
-                position = None
-                continue
+            a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else 1e-6
 
-    # ----- Existing ATR stop / TP (priority 2) -----
+            # ----- HARD STOP (priority 1) -----
+            if stop_pct is not None:
+                if position.side == "long":
+                    hard_stop = position.entry_price * (1.0 - stop_pct/100.0)
+                    if float(low.iloc[i]) <= hard_stop:
+                        position.exit_time = t
+                        position.exit_price = float(hard_stop)
+                        position.pnl_pct = (hard_stop / position.entry_price - 1) * 100
+                        equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
+                        position = None
+                        continue
+                else:  # short
+                    hard_stop = position.entry_price * (1.0 + stop_pct/100.0)
+                    if float(high.iloc[i]) >= hard_stop:
+                        position.exit_time = t
+                        position.exit_price = float(hard_stop)
+                        position.pnl_pct = (position.entry_price / hard_stop - 1) * 100
+                        equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
+                        position = None
+                        continue
+
+            # ----- ATR stop / take profit (priority 2) -----
+            if position is not None:
+                if position.side == "long":
+                    stop = position.entry_price - stop_atr * a
+                    take = position.entry_price + take_atr * a
+                    if px <= stop or px >= take:
+                        position.exit_time = t
+                        position.exit_price = float(px)
+                        position.pnl_pct = (px / position.entry_price - 1) * 100
+                        equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
+                        position = None
+                else:
+                    stop = position.entry_price + stop_atr * a
+                    take = position.entry_price - take_atr * a
+                    if px >= stop or px <= take:
+                        position.exit_time = t
+                        position.exit_price = float(px)
+                        position.pnl_pct = (position.entry_price / px - 1) * 100
+                        equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
+                        position = None
+
     if position is not None:
-        if position.side == "long":
-            stop, take = position.entry_price - stop_atr * a, position.entry_price + take_atr * a
-            if close.iloc[i] <= stop or close.iloc[i] >= take:
-                px = float(close.iloc[i])
-                position.exit_time, position.exit_price = t, px
-                position.pnl_pct = (px / position.entry_price - 1) * 100
-                equity.append(equity[-1] * (1 + position.pnl_pct / 100)); equity_time.append(t)
-                position = None
-        else:
-            stop, take = position.entry_price + stop_atr * a, position.entry_price - take_atr * a
-            if close.iloc[i] >= stop or close.iloc[i] <= take:
-                px = float(close.iloc[i])
-                position.exit_time, position.exit_price = t, px
-                position.pnl_pct = (position.entry_price / px - 1) * 100
-                equity.append(equity[-1] * (1 + position.pnl_pct / 100)); equity_time.append(t)
-                position = None
+        last_px = float(close.iloc[-1])
+        pnl = (last_px / position.entry_price - 1) * 100 if position.side == "long" else (position.entry_price / last_px - 1) * 100
+        position.exit_time, position.exit_price, position.pnl_pct = close.index[-1], last_px, pnl
+        equity.append(equity[-1] * (1 + pnl/100)); equity_time.append(close.index[-1])
 
-        if position is not None:
-            last_px = float(close.iloc[-1])
-            pnl = (last_px / position.entry_price - 1) * 100 if position.side == "long" else (position.entry_price / last_px - 1) * 100
-            position.exit_time, position.exit_price, position.pnl_pct = close.index[-1], last_px, pnl
-            equity.append(equity[-1] * (1 + pnl / 100)); equity_time.append(close.index[-1])
-        return trades, pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index()
+    return trades, pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index()
+
 
     trades, equity = backtest_sr(prices, sr_levels,
     buffer_pct=buffer_pct,
