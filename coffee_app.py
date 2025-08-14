@@ -466,12 +466,12 @@ else:
         arr = np.array(levels, dtype=float)
         return float(arr[np.argmin(np.abs(arr - price))])
     
+# Confirmed pivot will be available only after 'half' bars (centered window)
+half = sr_window // 2 if (sr_window % 2) else (sr_window + 1) // 2
 
-# Confirmed pivot will be available only after 'half' bars (see backtest below)
-half = sr_window // 2 if sr_window % 2 else (sr_window + 1) // 2
-
-hi_piv = rolling_extrema(prices["High"], sr_window, "max")  # centered
-lo_piv = rolling_extrema(prices["Low"],  sr_window, "min")  # centered
+# Centered pivots (use only up to i - half inside the loop/live signal to avoid look-ahead)
+hi_piv = rolling_extrema(prices["High"], sr_window, "max")
+lo_piv = rolling_extrema(prices["Low"],  sr_window, "min")
 
 # right before building the SR live signal
 cut_live = max(0, len(prices) - 1 - half)
