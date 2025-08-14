@@ -12,6 +12,8 @@ from streamlit_autorefresh import st_autorefresh
 
 TICKER = "KC=F"
 DEFAULT_YEARS = 3
+STOP_PCT = 10.0  # fixed hard stop % for every trade
+
 
 st.set_page_config(page_title="Coffee Dashboard", layout="wide", initial_sidebar_state="expanded")
 st_autorefresh(interval=60000, key="data_refresh")  # 60,000 ms = 60 sec
@@ -349,7 +351,6 @@ with st.sidebar:
         use_chandelier = st.checkbox("Use Chandelier trailing stop", value=True)
         chand_n = st.slider("Chandelier lookback (N)", 10, 60, 22)
         chand_mult = st.slider("Chandelier ×ATR", 1.0, 5.0, 3.0, step=0.1)
-        stop_pct = st.slider("Hard stop (%)", 2.0, 20.0, 10.0, step=0.5, key="stop_pct_donchian")
         long_only = st.checkbox("Long-only", value=False)
         short_gate = st.checkbox("Gate shorts by SMA200 downtrend", value=True)
         optimize_d = st.button("🧪 Optimize Donchian (find best filters)")
