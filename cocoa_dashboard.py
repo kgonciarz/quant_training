@@ -313,7 +313,7 @@ def optimize_donchian(prices: pd.DataFrame, *,
 # Sidebar Controls
 # ----------------------------
 with st.sidebar:
-    st.header("Settings")
+    st.header("Cocoa Settings")
     end_default = today_utc()
     start_default = end_default - dt.timedelta(days=365 * DEFAULT_YEARS)
     start_date = st.date_input("Start date", value=start_default)
