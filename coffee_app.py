@@ -581,6 +581,8 @@ st.markdown(f"<h2 style='color:{signal_color};'>📢 Live Signal: {signal}</h2>"
 if 'reason' in locals() and reason:
     st.caption(reason)
 
+colA, colB, colC, colD, colE, colF = st.columns([1.4, 1, 1, 1, 1, 1.2])
+colA.markdown(f"### 📊 Current Bias: **{'LONG' if slope(prices['Close'], trend_len).iloc[-1] > 0 else 'SHORT'}**")
 colB.metric("Win Rate", f"{win_rate:.2f}%")
 colC.metric("Total Return", f"{total_return:+.2f}%")
 colD.metric("Max Drawdown", f"{mdd:.2f}%")
@@ -601,6 +603,8 @@ st.dataframe(pd.DataFrame({
 # ----------------------------
 fig = go.Figure()
 fig.add_trace(go.Candlestick(x=prices.index, open=prices["Open"], high=prices["High"], low=prices["Low"], close=prices["Close"], name="Price"))
+# Always defined even if no setup triggers a signal
+signal, reason = "HOLD", ""
 
 if strategy == "Donchian Breakout":
     he = plot_series["high_entry"]; le = plot_series["low_entry"]
@@ -619,6 +623,10 @@ if strategy == "Donchian Breakout":
 else:
     # show SR levels as in your original (optional)
     pass
+# --- Common metrics (works for both strategies) ---
+win_rate, total_return, n_trades = summarize_trades(trades)
+mdd = max_drawdown(equity)
+dir_stats = directional_breakdown(trades)
 
 # Trade markers
 long_x, long_y, short_x, short_y, exit_x, exit_y = [], [], [], [], [], []
