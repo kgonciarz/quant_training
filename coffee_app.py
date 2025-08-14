@@ -472,7 +472,7 @@ half = sr_window // 2 if (sr_window % 2) else (sr_window + 1) // 2
 # Centered pivots (use only up to i - half inside the loop/live signal to avoid look-ahead)
 hi_piv = rolling_extrema(prices["High"], sr_window, "max")
 lo_piv = rolling_extrema(prices["Low"],  sr_window, "min")
-
+sr_plot_support, sr_plot_resist = None, None
 # right before building the SR live signal
 cut_live = max(0, len(prices) - 1 - half)
 sup_now = cluster_levels(list(lo_piv.iloc[:cut_live].dropna().values), cluster_tol)
@@ -588,15 +588,24 @@ def backtest_sr(
     return trades, pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index()
 
 
-    # compute SR levels and run backtest
-cut_live = max(0, len(prices) - 1 - half)  # only confirmed pivots up to yesterday
+# Use only history up to the last confirmed pivot (no look-ahead)
+cut_live = max(0, len(prices) - 1 - half)
 sup_now = cluster_levels(list(lo_piv.iloc[:cut_live].dropna().values), cluster_tol)
 res_now = cluster_levels(list(hi_piv.iloc[:cut_live].dropna().values), cluster_tol)
 
+# keep for plotting later
+sr_plot_support, sr_plot_resist = sup_now, res_now
+
 ns_price = nearest_level(last_close, sup_now)
 nr_price = nearest_level(last_close, res_now)
-# keep these around for the chart
-sr_plot_support, sr_plot_resist = sup_now, res_now
+
+trend_up, trend_down = trend_val > 0, trend_val < 0
+signal, reason = "HOLD", ""
+if trend_up and ns_price is not None and last_close <= ns_price * (1 + buffer_pct/100):
+    signal, reason = "BUY", f"Price {last_close:.2f} near support {ns_price:.2f} with uptrend"
+elif trend_down and nr_price is not None and last_close >= nr_price * (1 - buffer_pct/100):
+    signal, reason = "SELL", f"Price {last_close:.2f} near resistance {nr_price:.2f} with downtrend"
+
 
 
     # LIVE signal for SR
@@ -753,7 +762,7 @@ fig.add_trace(
         name="Price",
     )
 )
-sr_plot_support, sr_plot_resist = None, None
+
 if strategy == "Donchian Breakout":
     he = plot_series["high_entry"]; le = plot_series["low_entry"]
     hx = plot_series["high_exit"];  lx = plot_series["low_exit"]
