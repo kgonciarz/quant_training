@@ -589,25 +589,35 @@ dir_stats = directional_breakdown(trades)
 # ----------------------------
 # Header signal & metrics
 # ----------------------------
+# --- Live header (replace your current block with this) ---
 signal_color = {"BUY": "green", "SELL": "red", "HOLD": "gray"}[signal]
 st.markdown(f"<h2 style='color:{signal_color};'>📢 Live Signal: {signal}</h2>", unsafe_allow_html=True)
 if reason:
     st.caption(reason)
 
-# Determine suggested live action (purely informational)
+# Determine suggested live action (only show when not obvious)
+position_open = bool(trades) and trades[-1].exit_time is None
+position_side = trades[-1].side if position_open else None
+
 live_action = "HOLD"
 if signal in ("SELL", "SHORT"):
-    if trades and trades[-1].exit_time is None and trades[-1].side == "long":
-        live_action = "CLOSE LONG → OPEN SHORT"
-    else:
-        live_action = "OPEN SHORT"
+    live_action = "CLOSE LONG → OPEN SHORT" if (position_open and position_side == "long") else "OPEN SHORT"
 elif signal == "BUY":
-    if trades and trades[-1].exit_time is None and trades[-1].side == "short":
-        live_action = "CLOSE SHORT → OPEN LONG"
-    else:
-        live_action = "OPEN LONG"
+    live_action = "CLOSE SHORT → OPEN LONG" if (position_open and position_side == "short") else "OPEN LONG"
 
-st.subheader(f"Live action: {live_action}")
+# Show the action only if it's more than the default advice
+default_action = (
+    "OPEN LONG" if signal == "BUY"
+    else ("OPEN SHORT" if signal in ("SELL", "SHORT") else "HOLD")
+)
+if live_action != default_action:
+    st.subheader(f"Live action: {live_action}")
+
+# (optional) Only show bias if it disagrees with the signal
+sig_dir = "LONG" if signal == "BUY" else ("SHORT" if signal in ("SELL", "SHORT") else None)
+if sig_dir != bias:
+    st.markdown(f"### 📊 Current Bias: **{bias}**")
+
 
 
 colA, colB, colC, colD, colE, colF = st.columns([1.4, 1, 1, 1, 1, 1.2])
