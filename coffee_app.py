@@ -379,13 +379,12 @@ if prices.empty:
     st.warning("No data returned."); st.stop()
 
 # ----------------------------
-# Strategy & Metrics (robust)
+# Strategy & Metrics (FIXED)
 # ----------------------------
 trend_val = slope(prices["Close"], trend_len).iloc[-1]
 trend_val = float(trend_val) if pd.notna(trend_val) else 0.0
 bias = "LONG" if trend_val > 0 else "SHORT"
 last_close = float(prices["Close"].iloc[-1])
-
 
 
 if strategy == "Donchian Breakout":
@@ -396,10 +395,10 @@ if strategy == "Donchian Breakout":
         adx_period=14, adx_min=adx_min, use_adx=use_adx,
         use_chandelier=use_chandelier,
         long_only=long_only, short_trend_gate=short_gate, trend_sma=200,
-        stop_pct=stop_pct,   # 10% hard stop from sidebar
+        stop_pct=stop_pct,   # from sidebar
     )
 
-    # LIVE signal from prior bar
+    # Live signal from prior bar
     he, le, adx_s = plot_series["high_entry"], plot_series["low_entry"], plot_series["adx"]
     he_prev = float(he.iloc[-2]) if len(he) >= 2 and np.isfinite(he.iloc[-2]) else np.nan
     le_prev = float(le.iloc[-2]) if len(le) >= 2 and np.isfinite(le.iloc[-2]) else np.nan
@@ -410,7 +409,7 @@ if strategy == "Donchian Breakout":
         signal, reason = "SELL", f"Close {last_close:.2f} < {n_entry}-day low {le_prev:.2f}" + (f" (ADX≥{adx_min:.0f})" if use_adx else "")
 
 else:
-    # --- S/R path ---
+    # ---- S/R utilities & backtest are defined BEFORE calling them ----
     @dataclass
     class SRLevels:
         support: List[float]
@@ -454,6 +453,91 @@ else:
         arr = np.array(levels, dtype=float)
         return float(arr[np.argmin(np.abs(arr - price))])
 
+    # ---- SR backtest with 10% hard stop ----
+    def backtest_sr(
+        df: pd.DataFrame,
+        sr: "SRLevels",
+        buffer_pct: float = 0.3,
+        atr_period: int = 14,
+        stop_atr: float = 2.0,
+        take_atr: float = 3.0,
+        stop_pct: Optional[float] = 10.0,
+    ) -> Tuple[List[Trade], pd.Series]:
+        close = df["Close"].astype(float)
+        high  = df["High"].astype(float)
+        low   = df["Low"].astype(float)
+        atr = compute_atr_sma(df, atr_period)
+        trend = slope(close, 50).reindex(df.index)
+
+        trades: List[Trade] = []
+        equity, equity_time = [1.0], [df.index[0]]
+        position: Optional[Trade] = None
+
+        for i, (t, px) in enumerate(close.items()):
+            tr_val = float(trend.iloc[i]) if pd.notna(trend.iloc[i]) else 0.0
+            tr_up, tr_dn = tr_val > 0, tr_val < 0
+            ns = nearest_level(px, sr.support)
+            nr = nearest_level(px, sr.resistance)
+
+            if position is None:
+                if tr_up and ns and px <= ns * (1 + buffer_pct / 100.0):
+                    position = Trade(t, float(px), "long"); trades.append(position)
+                elif tr_dn and nr and px >= nr * (1 - buffer_pct / 100.0):
+                    position = Trade(t, float(px), "short"); trades.append(position)
+            else:
+                a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else 1e-6
+
+                # Hard stop (priority 1)
+                if stop_pct is not None:
+                    if position.side == "long":
+                        hard_stop = position.entry_price * (1.0 - stop_pct/100.0)
+                        if float(low.iloc[i]) <= hard_stop:
+                            position.exit_time = t
+                            position.exit_price = float(hard_stop)
+                            position.pnl_pct = (hard_stop / position.entry_price - 1) * 100
+                            equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
+                            position = None
+                            continue
+                    else:
+                        hard_stop = position.entry_price * (1.0 + stop_pct/100.0)
+                        if float(high.iloc[i]) >= hard_stop:
+                            position.exit_time = t
+                            position.exit_price = float(hard_stop)
+                            position.pnl_pct = (position.entry_price / hard_stop - 1) * 100
+                            equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
+                            position = None
+                            continue
+
+                # ATR stop / take profit (priority 2)
+                if position is not None:
+                    if position.side == "long":
+                        stop = position.entry_price - stop_atr * a
+                        take = position.entry_price + take_atr * a
+                        if px <= stop or px >= take:
+                            position.exit_time = t
+                            position.exit_price = float(px)
+                            position.pnl_pct = (px / position.entry_price - 1) * 100
+                            equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
+                            position = None
+                    else:
+                        stop = position.entry_price + stop_atr * a
+                        take = position.entry_price - take_atr * a
+                        if px >= stop or px <= take:
+                            position.exit_time = t
+                            position.exit_price = float(px)
+                            position.pnl_pct = (position.entry_price / px - 1) * 100
+                            equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
+                            position = None
+
+        if position is not None:
+            last_px = float(close.iloc[-1])
+            pnl = (last_px / position.entry_price - 1) * 100 if position.side == "long" else (position.entry_price / last_px - 1) * 100
+            position.exit_time, position.exit_price, position.pnl_pct = close.index[-1], last_px, pnl
+            equity.append(equity[-1] * (1 + pnl/100)); equity_time.append(close.index[-1])
+
+        return trades, pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index()
+
+    # compute SR levels and run backtest
     sr_levels = detect_sr(prices, sr_window, cluster_tol)
     ns_price  = nearest_level(last_close, sr_levels.support)
     nr_price  = nearest_level(last_close, sr_levels.resistance)
@@ -465,7 +549,7 @@ else:
     elif trend_down and nr_price is not None and last_close >= nr_price * (1 - buffer_pct/100):
         signal, reason = "SELL", f"Price {last_close:.2f} near resistance {nr_price:.2f} with downtrend"
 
-    # RUN the SR backtest (10% hard stop supported)
+    # run SR backtest (now defined above)
     trades, equity = backtest_sr(
         prices, sr_levels,
         buffer_pct=buffer_pct,
@@ -475,10 +559,11 @@ else:
         stop_pct=stop_pct,
     )
 
-# --- Common metrics (always compute before rendering header) ---
+# --- Common metrics (compute BEFORE rendering header) ---
 win_rate, total_return, n_trades = summarize_trades(trades)
 mdd = max_drawdown(equity)
 dir_stats = directional_breakdown(trades)
+
 
 
 # Trade markers
