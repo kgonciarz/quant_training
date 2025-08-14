@@ -385,6 +385,7 @@ trend_val = slope(prices["Close"], trend_len).iloc[-1]
 trend_val = float(trend_val) if pd.notna(trend_val) else 0.0
 bias = "LONG" if trend_val > 0 else "SHORT"
 last_close = float(prices["Close"].iloc[-1])
+signal, reason = "HOLD", ""
 
 
 if strategy == "Donchian Breakout":
@@ -564,20 +565,97 @@ win_rate, total_return, n_trades = summarize_trades(trades)
 mdd = max_drawdown(equity)
 dir_stats = directional_breakdown(trades)
 
+# ----------------------------
+# Header signal & metrics
+# ----------------------------
+signal_color = {"BUY": "green", "SELL": "red", "HOLD": "gray"}[signal]
+st.markdown(f"<h2 style='color:{signal_color};'>📢 Live Signal: {signal}</h2>", unsafe_allow_html=True)
+if reason:
+    st.caption(reason)
 
+colA, colB, colC, colD, colE, colF = st.columns([1.4, 1, 1, 1, 1, 1.2])
+colA.markdown(f"### 📊 Current Bias: **{bias}**")
+colB.metric("Win Rate", f"{win_rate:.2f}%")
+colC.metric("Total Return", f"{total_return:+.2f}%")
+colD.metric("Max Drawdown", f"{mdd:.2f}%")
+colE.metric("Trades", f"{n_trades}")
 
-# Trade markers
+st.write("**Directional breakdown**")
+st.dataframe(pd.DataFrame({
+    "side": ["long","short"],
+    "n": [dir_stats["long"]["n"], dir_stats["short"]["n"]],
+    "win%": [round(dir_stats["long"]["win"],2), round(dir_stats["short"]["win"],2)],
+    "net%": [round(dir_stats["long"]["net"],2), round(dir_stats["short"]["net"],2)],
+}), use_container_width=True)
+
+# ----------------------------
+# Chart
+# ----------------------------
+fig = go.Figure()
+fig.add_trace(
+    go.Candlestick(
+        x=prices.index,
+        open=prices["Open"],
+        high=prices["High"],
+        low=prices["Low"],
+        close=prices["Close"],
+        name="Price",
+    )
+)
+
+if strategy == "Donchian Breakout":
+    he = plot_series["high_entry"]; le = plot_series["low_entry"]
+    hx = plot_series["high_exit"];  lx = plot_series["low_exit"]
+    ch_l = plot_series["chand_long"]; ch_s = plot_series["chand_short"]
+    sma_long = plot_series["sma_long"]
+
+    fig.add_trace(go.Scatter(x=he.index, y=he, name=f"{n_entry}D High", mode="lines"))
+    fig.add_trace(go.Scatter(x=le.index, y=le, name=f"{n_entry}D Low", mode="lines"))
+    fig.add_trace(go.Scatter(x=hx.index, y=hx, name=f"{n_exit}D High (exit)", mode="lines", line=dict(dash="dot")))
+    fig.add_trace(go.Scatter(x=lx.index, y=lx, name=f"{n_exit}D Low (exit)", mode="lines", line=dict(dash="dot")))
+    if use_chandelier:
+        fig.add_trace(go.Scatter(x=ch_l.index, y=ch_l, name="Chandelier Long", mode="lines"))
+        fig.add_trace(go.Scatter(x=ch_s.index, y=ch_s, name="Chandelier Short", mode="lines"))
+    if short_gate:
+        fig.add_trace(go.Scatter(x=sma_long.index, y=sma_long, name="SMA200", mode="lines"))
+else:
+    # draw SR levels
+    for lvl in sr_levels.support:
+        fig.add_hline(y=lvl, line_width=1, line_dash="dot", line_color="green", opacity=0.5)
+    for lvl in sr_levels.resistance:
+        fig.add_hline(y=lvl, line_width=1, line_dash="dot", line_color="red", opacity=0.5)
+
+# Trade markers (AFTER fig is created)
 long_x, long_y, short_x, short_y, exit_x, exit_y = [], [], [], [], [], []
 for t in trades:
-    if t.side == "long": long_x.append(t.entry_time); long_y.append(t.entry_price)
-    else: short_x.append(t.entry_time); short_y.append(t.entry_price)
-    if t.exit_time and t.exit_price: exit_x.append(t.exit_time); exit_y.append(t.exit_price)
-if long_x: fig.add_trace(go.Scatter(x=long_x, y=long_y, mode="markers", name="Buy", marker=dict(symbol="triangle-up", size=10, color="green")))
-if short_x and not (strategy=="Donchian Breakout" and long_only): fig.add_trace(go.Scatter(x=short_x, y=short_y, mode="markers", name="Sell", marker=dict(symbol="triangle-down", size=10, color="red")))
-if exit_x: fig.add_trace(go.Scatter(x=exit_x, y=exit_y, mode="markers", name="Exit", marker=dict(symbol="x", size=9, color="gray")))
+    if t.side == "long":
+        long_x.append(t.entry_time); long_y.append(t.entry_price)
+    else:
+        short_x.append(t.entry_time); short_y.append(t.entry_price)
+    if t.exit_time is not None and t.exit_price is not None:
+        exit_x.append(t.exit_time); exit_y.append(t.exit_price)
 
+if long_x:
+    fig.add_trace(go.Scatter(x=long_x, y=long_y, mode="markers", name="Buy",
+                             marker=dict(symbol="triangle-up", size=10, color="green")))
+if short_x and not (strategy == "Donchian Breakout" and long_only):
+    fig.add_trace(go.Scatter(x=short_x, y=short_y, mode="markers", name="Sell",
+                             marker=dict(symbol="triangle-down", size=10, color="red")))
+if exit_x:
+    fig.add_trace(go.Scatter(x=exit_x, y=exit_y, mode="markers", name="Exit",
+                             marker=dict(symbol="x", size=9, color="gray")))
+
+# Background bias band
 bg_color = "rgba(0,128,0,0.07)" if bias == "LONG" else "rgba(220,20,60,0.07)"
-fig.add_vrect(x0=prices.index[-min(len(prices), 100)], x1=prices.index.max(), fillcolor=bg_color, line_width=0, layer="below")
+fig.add_vrect(
+    x0=prices.index[-min(len(prices), 100)],
+    x1=prices.index.max(),
+    fillcolor=bg_color,
+    line_width=0,
+    layer="below",
+)
+
 fig.update_layout(height=720, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="Price")
 st.plotly_chart(fig, use_container_width=True)
+
 
