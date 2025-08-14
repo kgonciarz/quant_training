@@ -377,6 +377,12 @@ with st.sidebar:
         stop_atr = st.slider("Stop Loss (×ATR)", 0.5, 5.0, 2.0, step=0.1)
         take_atr = st.slider("Take Profit (×ATR)", 0.5, 8.0, 3.0, step=0.1)
         stop_pct   = st.slider("Hard stop (%)", 2.0, 20.0, 10.0, step=0.5, key="stop_pct_sr")
+        # Visuals for SR zones
+        show_sr_zones = st.checkbox("Show SR zones", True)
+        zone_pct = st.slider("SR zone width (%)", 0.1, 3.0, 0.6, step=0.1)
+        max_zones = st.slider("Max zones each side", 1, 8, 3)
+        show_zone_midline = st.checkbox("Show zone midline", True)
+
         optimize_sr = st.button("🧪 Optimize SR")
 
     auto_refresh = st.checkbox("Auto-refresh every 60s", value=True)
@@ -603,6 +609,58 @@ st.dataframe(pd.DataFrame({
     "net%": [round(dir_stats["long"]["net"],2), round(dir_stats["short"]["net"],2)],
 }), use_container_width=True)
 
+def draw_sr_zones(
+    fig: go.Figure,
+    supports: list[float],
+    resistances: list[float],
+    price_index: pd.Index,
+    pct: float = 0.6,
+    max_each: int = 3,
+    show_midline: bool = True,
+):
+    """Draw shaded SR zones like the screenshot."""
+    x0, x1 = price_index.min(), price_index.max()
+
+    # nearest N to current price (keeps chart clean)
+    last_px = None
+    try:
+        last_px = float(prices["Close"].iloc[-1])
+    except Exception:
+        last_px = None
+
+    def nearest(levels):
+        if last_px is None:
+            return levels[:max_each]
+        return [lv for lv in sorted(levels, key=lambda y: abs(y - last_px))[:max_each]]
+
+    # Support (green)
+    for y in nearest(list(supports)):
+        y0 = y * (1 - pct / 100.0)
+        y1 = y * (1 + pct / 100.0)
+        # hrect (Plotly ≥5.3). If unavailable, use add_shape(type="rect", ...)
+        fig.add_shape(
+            type="rect", xref="x", yref="y",
+            x0=x0, x1=x1, y0=y0, y1=y1,
+            fillcolor="rgba(...)", opacity=1.0,
+            line=dict(color="rgba(...)", width=1, dash="dot"),
+            layer="below",
+                )
+        if show_midline:
+            fig.add_hline(y=y, line_color="rgba(46,125,50,0.8)", line_dash="dot", line_width=1)
+
+    # Resistance (red)
+    for y in nearest(list(resistances)):
+        y0 = y * (1 - pct / 100.0)
+        y1 = y * (1 + pct / 100.0)
+        fig.add_shape(
+            y0=y0, y1=y1, x0=x0, x1=x1,
+            fillcolor="rgba(244,67,54,0.18)",  # red 500 ~ 0.18
+            line=dict(color="rgba(183,28,28,0.6)", width=1, dash="dot"),
+            layer="below",
+        )
+        if show_midline:
+            fig.add_hline(y=y, line_color="rgba(183,28,28,0.8)", line_dash="dot", line_width=1)
+
 # ----------------------------
 # Chart
 # ----------------------------
@@ -635,10 +693,24 @@ if strategy == "Donchian Breakout":
         fig.add_trace(go.Scatter(x=sma_long.index, y=sma_long, name="SMA200", mode="lines"))
 else:
     # draw SR levels
-    for lvl in sr_levels.support:
-        fig.add_hline(y=lvl, line_width=1, line_dash="dot", line_color="green", opacity=0.5)
-    for lvl in sr_levels.resistance:
-        fig.add_hline(y=lvl, line_width=1, line_dash="dot", line_color="red", opacity=0.5)
+# SR zones like the screenshot
+    if show_sr_zones:
+        draw_sr_zones(
+            fig,
+            sr_levels.support,
+            sr_levels.resistance,
+            prices.index,
+            pct=zone_pct,
+            max_each=max_zones,
+            show_midline=show_zone_midline,
+        )
+    else:
+    # fallback: simple lines
+        for lvl in sr_levels.support:
+            fig.add_hline(y=lvl, line_width=1, line_dash="dot", line_color="green")
+        for lvl in sr_levels.resistance:
+            fig.add_hline(y=lvl, line_width=1, line_dash="dot", line_color="red")
+
 
 # Trade markers (AFTER fig is created)
 long_x, long_y, short_x, short_y, exit_x, exit_y = [], [], [], [], [], []
