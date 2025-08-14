@@ -594,6 +594,22 @@ st.markdown(f"<h2 style='color:{signal_color};'>📢 Live Signal: {signal}</h2>"
 if reason:
     st.caption(reason)
 
+# Determine suggested live action (purely informational)
+live_action = "HOLD"
+if signal in ("SELL", "SHORT"):
+    if trades and trades[-1].exit_time is None and trades[-1].side == "long":
+        live_action = "CLOSE LONG → OPEN SHORT"
+    else:
+        live_action = "OPEN SHORT"
+elif signal == "BUY":
+    if trades and trades[-1].exit_time is None and trades[-1].side == "short":
+        live_action = "CLOSE SHORT → OPEN LONG"
+    else:
+        live_action = "OPEN LONG"
+
+st.subheader(f"Live action: {live_action}")
+
+
 colA, colB, colC, colD, colE, colF = st.columns([1.4, 1, 1, 1, 1, 1.2])
 colA.markdown(f"### 📊 Current Bias: **{bias}**")
 colB.metric("Win Rate", f"{win_rate:.2f}%")
