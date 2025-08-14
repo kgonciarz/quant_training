@@ -559,7 +559,6 @@ else:
         stop_atr=stop_atr,
         take_atr=take_atr,
         stop_pct=stop_pct,
-        hard_stop_pct=hard_stop_pct
     )
 
 # --- Common metrics (compute BEFORE rendering header) ---
