@@ -573,16 +573,6 @@ def backtest_sr(
     return trades, pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index()
 
 
-    trades, equity = backtest_sr(prices, sr_levels,
-    buffer_pct=buffer_pct,
-    atr_period=atr_period,
-    stop_atr=stop_atr,
-    take_atr=take_atr,
-    stop_pct=stop_pct)
-    win_rate, total_return, n_trades = summarize_trades(trades)
-    mdd = max_drawdown(equity)
-    dir_stats = directional_breakdown(trades)
-
 # ----------------------------
 # Header signal & metrics
 # ----------------------------
