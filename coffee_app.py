@@ -460,126 +460,164 @@ else:
                 else: clusters.append([lv])
         return [float(np.mean(c)) for c in clusters]
 
-    def detect_sr(df: pd.DataFrame, window: int = 25, cluster_tol_pct: float = 0.6) -> SRLevels:
-        highs = rolling_extrema(df["High"], window, "max").dropna()
-        lows  = rolling_extrema(df["Low"],  window, "min").dropna()
-        res = cluster_levels(list(highs.values), cluster_tol_pct)
-        sup = cluster_levels(list(lows.values),  cluster_tol_pct)
-        lo, hi = float(df["Low"].min()), float(df["High"].max())
-        sup = [x for x in sup if lo <= x <= hi]
-        res = [x for x in res if lo <= x <= hi]
-        return SRLevels(support=sup, resistance=res)
 
     def nearest_level(price: float, levels: List[float]) -> Optional[float]:
         if not levels: return None
         arr = np.array(levels, dtype=float)
         return float(arr[np.argmin(np.abs(arr - price))])
+    
+
+# Confirmed pivot will be available only after 'half' bars (see backtest below)
+half = sr_window // 2 if sr_window % 2 else (sr_window + 1) // 2
+
+hi_piv = rolling_extrema(prices["High"], sr_window, "max")  # centered
+lo_piv = rolling_extrema(prices["Low"],  sr_window, "min")  # centered
+
+# right before building the SR live signal
+cut_live = max(0, len(prices) - 1 - half)
+sup_now = cluster_levels(list(lo_piv.iloc[:cut_live].dropna().values), cluster_tol)
+res_now = cluster_levels(list(hi_piv.iloc[:cut_live].dropna().values), cluster_tol)
+
+ns_price = nearest_level(last_close, sup_now)
+nr_price = nearest_level(last_close, res_now)
+
+trend_up, trend_down = trend_val > 0, trend_val < 0
+signal, reason = "HOLD", ""
+if trend_up and ns_price is not None and last_close <= ns_price * (1 + buffer_pct/100):
+    signal, reason = "BUY", f"Price {last_close:.2f} near support {ns_price:.2f} with uptrend"
+elif trend_down and nr_price is not None and last_close >= nr_price * (1 - buffer_pct/100):
+    signal, reason = "SELL", f"Price {last_close:.2f} near resistance {nr_price:.2f} with downtrend"
 
     # ---- SR backtest with 10% hard stop ----
-    def backtest_sr(
-        df: pd.DataFrame,
-        sr: "SRLevels",
-        buffer_pct: float = 0.3,
-        atr_period: int = 14,
-        stop_atr: float = 2.0,
-        take_atr: float = 3.0,
-        stop_pct: Optional[float] = 10.0,
-    ) -> Tuple[List[Trade], pd.Series]:
-        close = df["Close"].astype(float)
-        high  = df["High"].astype(float)
-        low   = df["Low"].astype(float)
-        atr = compute_atr_sma(df, atr_period)
-        trend = slope(close, 50).reindex(df.index)
+def backtest_sr(
+    df: pd.DataFrame,
+    hi_piv: pd.Series,
+    lo_piv: pd.Series,
+    cluster_tol: float,
+    buffer_pct: float = 0.3,
+    atr_period: int = 14,
+    stop_atr: float = 2.0,
+    take_atr: float = 3.0,
+    stop_pct: Optional[float] = 10.0,
+) -> Tuple[List[Trade], pd.Series]:
+    close = df["Close"].astype(float)
+    high  = df["High"].astype(float)
+    low   = df["Low"].astype(float)
+    atr   = compute_atr_sma(df, atr_period)
+    trend = slope(close, 50).reindex(df.index)
 
-        trades: List[Trade] = []
-        equity, equity_time = [1.0], [df.index[0]]
-        position: Optional[Trade] = None
+    trades: List[Trade] = []
+    equity, equity_time = [1.0], [df.index[0]]
+    position: Optional[Trade] = None
 
-        for i, (t, px) in enumerate(close.items()):
-            tr_val = float(trend.iloc[i]) if pd.notna(trend.iloc[i]) else 0.0
-            tr_up, tr_dn = tr_val > 0, tr_val < 0
-            ns = nearest_level(px, sr.support)
-            nr = nearest_level(px, sr.resistance)
+    for i, (t, px) in enumerate(close.items()):
+        # --- build levels using ONLY confirmed pivots available at time i ---
+        # a centered window needs 'half' future bars to confirm a pivot,
+        # so only use pivots with index <= i - half
+        cut = max(0, i - half)
+        past_highs = list(hi_piv.iloc[:cut].dropna().values)
+        past_lows  = list(lo_piv.iloc[:cut].dropna().values)
+        res_levels = cluster_levels(past_highs, cluster_tol)
+        sup_levels = cluster_levels(past_lows,  cluster_tol)
 
-            if position is None:
-                if tr_up and ns and px <= ns * (1 + buffer_pct / 100.0):
-                    position = Trade(t, float(px), "long"); trades.append(position)
-                elif tr_dn and nr and px >= nr * (1 - buffer_pct / 100.0):
-                    position = Trade(t, float(px), "short"); trades.append(position)
-            else:
-                a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else 1e-6
+        ns = nearest_level(px, sup_levels)
+        nr = nearest_level(px, res_levels)
 
-                # Hard stop (priority 1)
-                if stop_pct is not None:
-                    if position.side == "long":
-                        hard_stop = position.entry_price * (1.0 - stop_pct/100.0)
-                        if float(low.iloc[i]) <= hard_stop:
-                            position.exit_time = t
-                            position.exit_price = float(hard_stop)
-                            position.pnl_pct = (hard_stop / position.entry_price - 1) * 100
-                            equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
-                            position = None
-                            continue
-                    else:
-                        hard_stop = position.entry_price * (1.0 + stop_pct/100.0)
-                        if float(high.iloc[i]) >= hard_stop:
-                            position.exit_time = t
-                            position.exit_price = float(hard_stop)
-                            position.pnl_pct = (position.entry_price / hard_stop - 1) * 100
-                            equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
-                            position = None
-                            continue
+        tr_val = float(trend.iloc[i]) if pd.notna(trend.iloc[i]) else 0.0
+        tr_up, tr_dn = tr_val > 0, tr_val < 0
 
-                # ATR stop / take profit (priority 2)
-                if position is not None:
-                    if position.side == "long":
-                        stop = position.entry_price - stop_atr * a
-                        take = position.entry_price + take_atr * a
-                        if px <= stop or px >= take:
-                            position.exit_time = t
-                            position.exit_price = float(px)
-                            position.pnl_pct = (px / position.entry_price - 1) * 100
-                            equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
-                            position = None
-                    else:
-                        stop = position.entry_price + stop_atr * a
-                        take = position.entry_price - take_atr * a
-                        if px >= stop or px <= take:
-                            position.exit_time = t
-                            position.exit_price = float(px)
-                            position.pnl_pct = (position.entry_price / px - 1) * 100
-                            equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
-                            position = None
+        # --- entries ---
+        if position is None:
+            if tr_up and ns and px <= ns * (1 + buffer_pct/100.0):
+                position = Trade(t, float(px), "long"); trades.append(position)
+            elif tr_dn and nr and px >= nr * (1 - buffer_pct/100.0):
+                position = Trade(t, float(px), "short"); trades.append(position)
+        else:
+            a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else 1e-6
 
-        if position is not None:
-            last_px = float(close.iloc[-1])
-            pnl = (last_px / position.entry_price - 1) * 100 if position.side == "long" else (position.entry_price / last_px - 1) * 100
-            position.exit_time, position.exit_price, position.pnl_pct = close.index[-1], last_px, pnl
-            equity.append(equity[-1] * (1 + pnl/100)); equity_time.append(close.index[-1])
+            # hard stop (priority 1)
+            if stop_pct is not None:
+                if position.side == "long":
+                    hard_stop = position.entry_price * (1.0 - stop_pct/100.0)
+                    if float(low.iloc[i]) <= hard_stop:
+                        position.exit_time = t
+                        position.exit_price = float(hard_stop)
+                        position.pnl_pct = (hard_stop / position.entry_price - 1) * 100
+                        equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
+                        position = None
+                        continue
+                else:
+                    hard_stop = position.entry_price * (1.0 + stop_pct/100.0)
+                    if float(high.iloc[i]) >= hard_stop:
+                        position.exit_time = t
+                        position.exit_price = float(hard_stop)
+                        position.pnl_pct = (position.entry_price / hard_stop - 1) * 100
+                        equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
+                        position = None
+                        continue
 
-        return trades, pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index()
+            # ATR stop / take (priority 2)
+            if position is not None:
+                if position.side == "long":
+                    stop = position.entry_price - stop_atr * a
+                    take = position.entry_price + take_atr * a
+                    if px <= stop or px >= take:
+                        position.exit_time = t
+                        position.exit_price = float(px)
+                        position.pnl_pct = (px / position.entry_price - 1) * 100
+                        equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
+                        position = None
+                else:
+                    stop = position.entry_price + stop_atr * a
+                    take = position.entry_price - take_atr * a
+                    if px >= stop or px <= take:
+                        position.exit_time = t
+                        position.exit_price = float(px)
+                        position.pnl_pct = (position.entry_price / px - 1) * 100
+                        equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
+                        position = None
+
+    # close any open trade on the last bar
+    if position is not None:
+        last_px = float(close.iloc[-1])
+        pnl = (last_px / position.entry_price - 1) * 100 if position.side == "long" \
+              else (position.entry_price / last_px - 1) * 100
+        position.exit_time, position.exit_price, position.pnl_pct = close.index[-1], last_px, pnl
+        equity.append(equity[-1] * (1 + pnl/100)); equity_time.append(close.index[-1])
+
+    return trades, pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index()
+
 
     # compute SR levels and run backtest
-    sr_levels = detect_sr(prices, sr_window, cluster_tol)
-    ns_price  = nearest_level(last_close, sr_levels.support)
-    nr_price  = nearest_level(last_close, sr_levels.resistance)
+cut_live = max(0, len(prices) - 1 - half)  # only confirmed pivots up to yesterday
+sup_now = cluster_levels(list(lo_piv.iloc[:cut_live].dropna().values), cluster_tol)
+res_now = cluster_levels(list(hi_piv.iloc[:cut_live].dropna().values), cluster_tol)
+
+ns_price = nearest_level(last_close, sup_now)
+nr_price = nearest_level(last_close, res_now)
+
 
     # LIVE signal for SR
-    trend_up, trend_down = trend_val > 0, trend_val < 0
-    if trend_up and ns_price is not None and last_close <= ns_price * (1 + buffer_pct/100):
-        signal, reason = "BUY", f"Price {last_close:.2f} near support {ns_price:.2f} with uptrend"
-    elif trend_down and nr_price is not None and last_close >= nr_price * (1 - buffer_pct/100):
-        signal, reason = "SELL", f"Price {last_close:.2f} near resistance {nr_price:.2f} with downtrend"
+trend_up, trend_down = trend_val > 0, trend_val < 0
+if trend_up and ns_price is not None and last_close <= ns_price * (1 + buffer_pct/100):
+    signal, reason = "BUY", f"Price {last_close:.2f} near support {ns_price:.2f} with uptrend"
+elif trend_down and nr_price is not None and last_close >= nr_price * (1 - buffer_pct/100):
+    signal, reason = "SELL", f"Price {last_close:.2f} near resistance {nr_price:.2f} with downtrend"
 
     # run SR backtest (now defined above)
-    trades, equity = backtest_sr(
-        prices, sr_levels,
-        buffer_pct=buffer_pct,
-        atr_period=atr_period,
-        stop_atr=stop_atr,
-        take_atr=take_atr,
-        stop_pct=stop_pct,
-    )
+trades, equity = backtest_sr(
+prices,
+hi_piv=hi_piv,
+lo_piv=lo_piv,
+cluster_tol=cluster_tol,
+buffer_pct=buffer_pct,
+atr_period=atr_period,
+stop_atr=stop_atr,
+take_atr=take_atr,
+stop_pct=stop_pct,
+)
+
+
 
 # --- Common metrics (compute BEFORE rendering header) ---
 win_rate, total_return, n_trades = summarize_trades(trades)
