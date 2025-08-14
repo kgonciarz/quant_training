@@ -164,20 +164,20 @@ def backtest_donchian(
     long_only: bool = False,
     short_trend_gate: bool = True,
     trend_sma: int = 200,
-    stop_pct: float | None = 10.0,   
+    stop_pct: Optional[float] = 10.0,   # <- use Optional for broad Py versions
 ) -> Tuple[List[Trade], pd.Series, dict]:
     """Donchian breakout with optional ADX filter, Chandelier trailing stop,
-    and optional short-only regime gate (price < SMA(trend_sma))."""
+    optional short-only regime gate, and a hard loss-only stop in percent."""
     close = df["Close"].astype(float)
-    high = df["High"].astype(float)
-    low = df["Low"].astype(float)
+    high  = df["High"].astype(float)
+    low   = df["Low"].astype(float)
 
     atr = compute_atr_wilder(df, atr_period)
     adx = compute_adx(df, adx_period)
     sma_long = close.rolling(trend_sma, min_periods=trend_sma).mean()
 
     high_entry, low_entry = donchian_channels(df, n_entry)
-    high_exit, low_exit = donchian_channels(df, n_exit)
+    high_exit,  low_exit  = donchian_channels(df, n_exit)
     chand_long, chand_short = chandelier_stops(df, atr, chand_n, chand_mult)
 
     trades: List[Trade] = []
@@ -189,9 +189,10 @@ def backtest_donchian(
         px_h, px_l, px_c = float(high.iloc[i]), float(low.iloc[i]), float(close.iloc[i])
 
         hi_ent = float(high_entry.iloc[i-1]) if np.isfinite(high_entry.iloc[i-1]) else np.nan
-        lo_ent = float(low_entry.iloc[i-1]) if np.isfinite(low_entry.iloc[i-1]) else np.nan
-        hi_ex = float(high_exit.iloc[i-1]) if np.isfinite(high_exit.iloc[i-1]) else np.nan
-        lo_ex = float(low_exit.iloc[i-1]) if np.isfinite(low_exit.iloc[i-1]) else np.nan
+        lo_ent = float(low_entry.iloc[i-1])  if np.isfinite(low_entry.iloc[i-1])  else np.nan
+        hi_ex  = float(high_exit.iloc[i-1])  if np.isfinite(high_exit.iloc[i-1])  else np.nan
+        lo_ex  = float(low_exit.iloc[i-1])   if np.isfinite(low_exit.iloc[i-1])   else np.nan
+
         adx_ok = (float(adx.iloc[i-1]) >= adx_min) if (use_adx and np.isfinite(adx.iloc[i-1])) else True
         sma_ok_short = (float(sma_long.iloc[i-1]) > 0 and px_c < float(sma_long.iloc[i-1])) if short_trend_gate else True
 
@@ -204,7 +205,6 @@ def backtest_donchian(
             if (not long_only) and adx_ok and np.isfinite(lo_ent) and px_c < lo_ent and sma_ok_short:
                 position = Trade(t, float(px_c), "short"); trades.append(position); continue
         else:
-            # 🔁 REPLACE your current exit `else:` with THIS block:
             # ----- HARD STOP (priority 1) -----
             hit_hard = False
             if stop_pct is not None:
@@ -215,8 +215,7 @@ def backtest_donchian(
                         position.exit_price = float(hard_stop)
                         position.pnl_pct = (hard_stop / position.entry_price - 1) * 100
                         equity.append(equity[-1]*(1 + position.pnl_pct/100)); equity_time.append(t)
-                        position = None
-                        hit_hard = True
+                        position = None; hit_hard = True
                 else:
                     hard_stop = position.entry_price * (1.0 + stop_pct/100.0)
                     if px_h >= hard_stop:
@@ -224,8 +223,7 @@ def backtest_donchian(
                         position.exit_price = float(hard_stop)
                         position.pnl_pct = (position.entry_price / hard_stop - 1) * 100
                         equity.append(equity[-1]*(1 + position.pnl_pct/100)); equity_time.append(t)
-                        position = None
-                        hit_hard = True
+                        position = None; hit_hard = True
             if hit_hard:
                 continue
 
@@ -251,6 +249,22 @@ def backtest_donchian(
                         position.pnl_pct = (position.entry_price / exit_price - 1) * 100
                         equity.append(equity[-1]*(1 + position.pnl_pct/100)); equity_time.append(t)
                         position = None
+
+    # Close any open position at the last bar
+    if position is not None:
+        last_px = float(close.iloc[-1])
+        pnl = (last_px / position.entry_price - 1) * 100 if position.side == "long" \
+              else (position.entry_price / last_px - 1) * 100
+        position.exit_time, position.exit_price, position.pnl_pct = close.index[-1], last_px, pnl
+        equity.append(equity[-1]*(1 + pnl/100)); equity_time.append(close.index[-1])
+
+    plot_series = {
+        "high_entry": high_entry, "low_entry": low_entry,
+        "high_exit": high_exit,   "low_exit": low_exit,
+        "chand_long": chand_long, "chand_short": chand_short,
+        "adx": adx, "atr": atr, "sma_long": sma_long,
+    }
+    return trades, pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index(), plot_series
 
 # ----------------------------
 # Metrics & optimizer
