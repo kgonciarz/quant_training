@@ -397,7 +397,7 @@ if strategy == "Donchian Breakout":
         adx_period=14, adx_min=adx_min, use_adx=use_adx,
         use_chandelier=use_chandelier,
         long_only=long_only, short_trend_gate=short_gate, trend_sma=200,
-        stop_pct=stop_pct,   # from sidebar
+        stop_pct=STOP_PCT,   # from sidebar
     )
 
     # Live signal from prior bar
@@ -558,7 +558,7 @@ else:
         atr_period=atr_period,
         stop_atr=stop_atr,
         take_atr=take_atr,
-        stop_pct=stop_pct,
+        stop_pct=STOP_PCT,
     )
 
 # --- Common metrics (compute BEFORE rendering header) ---
