@@ -618,48 +618,60 @@ def draw_sr_zones(
     max_each: int = 3,
     show_midline: bool = True,
 ):
-    """Draw shaded SR zones like the screenshot."""
-    x0, x1 = price_index.min(), price_index.max()
+    """Draw shaded SR zones; uses add_hrect when available, otherwise add_shape with hex+opacity."""
+    x0 = price_index[0]
+    x1 = price_index[-1]
+    last_px = float(prices["Close"].iloc[-1]) if len(prices) else np.nan
+    use_hrect = hasattr(fig, "add_hrect")  # Plotly >= 5.3
 
-    # nearest N to current price (keeps chart clean)
-    last_px = None
-    try:
-        last_px = float(prices["Close"].iloc[-1])
-    except Exception:
-        last_px = None
+    # Colors (hex) — opacity handled via the 'opacity' kwarg
+    GREEN_FILL = "#4CAF50"
+    GREEN_LINE = "#2E7D32"
+    RED_FILL   = "#F44336"
+    RED_LINE   = "#B71C1C"
 
-    def nearest(levels):
-        if last_px is None:
-            return levels[:max_each]
-        return [lv for lv in sorted(levels, key=lambda y: abs(y - last_px))[:max_each]]
+    def nearest(levels, ref, k):
+        if not levels:
+            return []
+        if np.isfinite(ref):
+            levels = sorted(levels, key=lambda y: abs(y - ref))
+        return levels[:k]
 
-    # Support (green)
-    for y in nearest(list(supports)):
-        y0 = y * (1 - pct / 100.0)
-        y1 = y * (1 + pct / 100.0)
-        # hrect (Plotly ≥5.3). If unavailable, use add_shape(type="rect", ...)
-        fig.add_shape(
-            type="rect", xref="x", yref="y",
-            x0=x0, x1=x1, y0=y0, y1=y1,
-            fillcolor="rgba(...)", opacity=1.0,
-            line=dict(color="rgba(...)", width=1, dash="dot"),
-            layer="below",
-                )
+    # ---- Supports (green)
+    for y in nearest(list(supports), last_px, max_each):
+        y0 = y * (1 - pct/100.0)
+        y1 = y * (1 + pct/100.0)
+        if use_hrect:
+            fig.add_hrect(y0=y0, y1=y1, x0=x0, x1=x1,
+                          fillcolor=GREEN_FILL, opacity=0.18,
+                          line=dict(color=GREEN_LINE, width=1, dash="dot"),
+                          layer="below")
+        else:
+            fig.add_shape(type="rect", xref="x", yref="y",
+                          x0=x0, x1=x1, y0=y0, y1=y1,
+                          fillcolor=GREEN_FILL, opacity=0.18,
+                          line=dict(color=GREEN_LINE, width=1, dash="dot"),
+                          layer="below")
         if show_midline:
-            fig.add_hline(y=y, line_color="rgba(46,125,50,0.8)", line_dash="dot", line_width=1)
+            fig.add_hline(y=y, line_color=GREEN_LINE, line_dash="dot", line_width=1)
 
-    # Resistance (red)
-    for y in nearest(list(resistances)):
-        y0 = y * (1 - pct / 100.0)
-        y1 = y * (1 + pct / 100.0)
-        fig.add_shape(
-            y0=y0, y1=y1, x0=x0, x1=x1,
-            fillcolor="rgba(244,67,54,0.18)",  # red 500 ~ 0.18
-            line=dict(color="rgba(183,28,28,0.6)", width=1, dash="dot"),
-            layer="below",
-        )
+    # ---- Resistances (red)
+    for y in nearest(list(resistances), last_px, max_each):
+        y0 = y * (1 - pct/100.0)
+        y1 = y * (1 + pct/100.0)
+        if use_hrect:
+            fig.add_hrect(y0=y0, y1=y1, x0=x0, x1=x1,
+                          fillcolor=RED_FILL, opacity=0.18,
+                          line=dict(color=RED_LINE, width=1, dash="dot"),
+                          layer="below")
+        else:
+            fig.add_shape(type="rect", xref="x", yref="y",
+                          x0=x0, x1=x1, y0=y0, y1=y1,
+                          fillcolor=RED_FILL, opacity=0.18,
+                          line=dict(color=RED_LINE, width=1, dash="dot"),
+                          layer="below")
         if show_midline:
-            fig.add_hline(y=y, line_color="rgba(183,28,28,0.8)", line_dash="dot", line_width=1)
+            fig.add_hline(y=y, line_color=RED_LINE, line_dash="dot", line_width=1)
 
 # ----------------------------
 # Chart
