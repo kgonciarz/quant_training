@@ -320,7 +320,7 @@ with st.sidebar:
     end_date = st.date_input("End date", value=end_default)
 
     st.subheader("Strategy")
-    strategy = st.selectbox("Strategy", ["Donchian Breakout", "S/R Bounce (original)"], index=0)
+    strategy = st.selectbox("Strategy", ["S/R Bounce (original)", "Donchian Breakout"], index=0)
 
     trend_len = st.slider("Trend window for bias (SMA)", 20, 200, 50, step=5)
 
