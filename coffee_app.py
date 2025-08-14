@@ -735,13 +735,13 @@ for t in trades:
         exit_x.append(t.exit_time); exit_y.append(t.exit_price)
 
 if long_x:
-    fig.add_trace(go.Scatter(x=long_x, y=long_y, mode="markers", name="Buy",
+    fig.add_trace(go.Scatter(x=long_x, y=long_y, mode="markers", name="Long",
                              marker=dict(symbol="triangle-up", size=10, color="green")))
 if short_x and not (strategy == "Donchian Breakout" and long_only):
-    fig.add_trace(go.Scatter(x=short_x, y=short_y, mode="markers", name="Sell",
+    fig.add_trace(go.Scatter(x=short_x, y=short_y, mode="markers", name="Short",
                              marker=dict(symbol="triangle-down", size=10, color="red")))
 if exit_x:
-    fig.add_trace(go.Scatter(x=exit_x, y=exit_y, mode="markers", name="Exit",
+    fig.add_trace(go.Scatter(x=exit_x, y=exit_y, mode="markers", name="Close",
                              marker=dict(symbol="x", size=9, color="gray")))
 
 # Background bias band
