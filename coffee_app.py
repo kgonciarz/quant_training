@@ -581,12 +581,11 @@ st.markdown(f"<h2 style='color:{signal_color};'>📢 Live Signal: {signal}</h2>"
 if 'reason' in locals() and reason:
     st.caption(reason)
 
-colA, colB, colC, colD, colE, colF = st.columns([1.4, 1, 1, 1, 1, 1.2])
-colA.markdown(f"### 📊 Current Bias: **{bias}**")
 colB.metric("Win Rate", f"{win_rate:.2f}%")
 colC.metric("Total Return", f"{total_return:+.2f}%")
 colD.metric("Max Drawdown", f"{mdd:.2f}%")
 colE.metric("Trades", f"{n_trades}")
+
 
 # Long vs Short breakdown
 st.write("**Directional breakdown**")
