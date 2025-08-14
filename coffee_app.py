@@ -202,39 +202,53 @@ def backtest_donchian(
             if (not long_only) and adx_ok and np.isfinite(lo_ent) and px_c < lo_ent and sma_ok_short:
                 position = Trade(t, float(px_c), "short"); trades.append(position); continue
         else:
-            # Intrabar exit logic. If Chandelier disabled, use only Donchian exits.
-            if position.side == "long":
-                stop_hit = np.isfinite(chand_l) and (px_l <= chand_l)
-                exit_hit = np.isfinite(lo_ex) and (px_c < lo_ex)
-                if stop_hit or exit_hit:
-                    exit_price = chand_l if stop_hit else px_c
-                    position.exit_time, position.exit_price = t, float(exit_price)
-                    position.pnl_pct = (exit_price / position.entry_price - 1) * 100
-                    equity.append(equity[-1] * (1 + position.pnl_pct / 100)); equity_time.append(t)
-                    position = None
-            else:
-                stop_hit = np.isfinite(chand_s) and (px_h >= chand_s)
-                exit_hit = np.isfinite(hi_ex) and (px_c > hi_ex)
-                if stop_hit or exit_hit:
-                    exit_price = chand_s if stop_hit else px_c
-                    position.exit_time, position.exit_price = t, float(exit_price)
-                    position.pnl_pct = (position.entry_price / exit_price - 1) * 100
-                    equity.append(equity[-1] * (1 + position.pnl_pct / 100)); equity_time.append(t)
-                    position = None
+            # 🔁 REPLACE your current exit `else:` with THIS block:
+            # ----- HARD STOP (priority 1) -----
+            hit_hard = False
+            if stop_pct is not None:
+                if position.side == "long":
+                    hard_stop = position.entry_price * (1.0 - stop_pct/100.0)
+                    if px_l <= hard_stop:
+                        position.exit_time = t
+                        position.exit_price = float(hard_stop)
+                        position.pnl_pct = (hard_stop / position.entry_price - 1) * 100
+                        equity.append(equity[-1]*(1 + position.pnl_pct/100)); equity_time.append(t)
+                        position = None
+                        hit_hard = True
+                else:
+                    hard_stop = position.entry_price * (1.0 + stop_pct/100.0)
+                    if px_h >= hard_stop:
+                        position.exit_time = t
+                        position.exit_price = float(hard_stop)
+                        position.pnl_pct = (position.entry_price / hard_stop - 1) * 100
+                        equity.append(equity[-1]*(1 + position.pnl_pct/100)); equity_time.append(t)
+                        position = None
+                        hit_hard = True
+            if hit_hard:
+                continue
 
-    if position is not None:
-        last_px = float(close.iloc[-1])
-        pnl = (last_px / position.entry_price - 1) * 100 if position.side == "long" else (position.entry_price / last_px - 1) * 100
-        position.exit_time, position.exit_price, position.pnl_pct = close.index[-1], last_px, pnl
-        equity.append(equity[-1] * (1 + pnl / 100)); equity_time.append(close.index[-1])
-
-    plot_series = {
-        "high_entry": high_entry, "low_entry": low_entry,
-        "high_exit": high_exit,   "low_exit": low_exit,
-        "chand_long": chand_long, "chand_short": chand_short,
-        "adx": adx, "atr": atr, "sma_long": sma_long,
-    }
-    return trades, pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index(), plot_series
+            # ----- Existing exits (priority 2) -----
+            if position is not None:
+                if position.side == "long":
+                    stop_hit = np.isfinite(chand_l) and (px_l <= chand_l)
+                    exit_hit = np.isfinite(lo_ex)   and (px_c < lo_ex)
+                    if stop_hit or exit_hit:
+                        exit_price = chand_l if stop_hit else px_c
+                        position.exit_time = t
+                        position.exit_price = float(exit_price)
+                        position.pnl_pct = (exit_price / position.entry_price - 1) * 100
+                        equity.append(equity[-1]*(1 + position.pnl_pct/100)); equity_time.append(t)
+                        position = None
+                else:
+                    stop_hit = np.isfinite(chand_s) and (px_h >= chand_s)
+                    exit_hit = np.isfinite(hi_ex)   and (px_c > hi_ex)
+                    if stop_hit or exit_hit:
+                        exit_price = chand_s if stop_hit else px_c
+                        position.exit_time = t
+                        position.exit_price = float(exit_price)
+                        position.pnl_pct = (position.entry_price / exit_price - 1) * 100
+                        equity.append(equity[-1]*(1 + position.pnl_pct/100)); equity_time.append(t)
+                        position = None
 
 # ----------------------------
 # Metrics & optimizer
@@ -372,11 +386,9 @@ trend_val = float(trend_val) if pd.notna(trend_val) else 0.0
 bias = "LONG" if trend_val > 0 else "SHORT"
 last_close = float(prices["Close"].iloc[-1])
 
-# Always defined even if no signal conditions hit
-signal, reason = "HOLD", ""
+
 
 if strategy == "Donchian Breakout":
-    # run donchian
     trades, equity, plot_series = backtest_donchian(
         prices,
         n_entry=n_entry, n_exit=n_exit,
@@ -384,9 +396,10 @@ if strategy == "Donchian Breakout":
         adx_period=14, adx_min=adx_min, use_adx=use_adx,
         use_chandelier=use_chandelier,
         long_only=long_only, short_trend_gate=short_gate, trend_sma=200,
-        stop_pct=stop_pct,  # from the Donchian sidebar slider
+        stop_pct=stop_pct,   # 10% hard stop from sidebar
     )
-    # Live signal from prior bar
+
+    # LIVE signal from prior bar
     he, le, adx_s = plot_series["high_entry"], plot_series["low_entry"], plot_series["adx"]
     he_prev = float(he.iloc[-2]) if len(he) >= 2 and np.isfinite(he.iloc[-2]) else np.nan
     le_prev = float(le.iloc[-2]) if len(le) >= 2 and np.isfinite(le.iloc[-2]) else np.nan
@@ -395,6 +408,7 @@ if strategy == "Donchian Breakout":
         signal, reason = "BUY", f"Close {last_close:.2f} > {n_entry}-day high {he_prev:.2f}" + (f" (ADX≥{adx_min:.0f})" if use_adx else "")
     elif (not long_only) and np.isfinite(le_prev) and adx_ok and last_close < le_prev:
         signal, reason = "SELL", f"Close {last_close:.2f} < {n_entry}-day low {le_prev:.2f}" + (f" (ADX≥{adx_min:.0f})" if use_adx else "")
+
 else:
     # --- S/R path ---
     @dataclass
@@ -444,82 +458,28 @@ else:
     ns_price  = nearest_level(last_close, sr_levels.support)
     nr_price  = nearest_level(last_close, sr_levels.resistance)
 
-    # Live signal for SR
+    # LIVE signal for SR
     trend_up, trend_down = trend_val > 0, trend_val < 0
     if trend_up and ns_price is not None and last_close <= ns_price * (1 + buffer_pct/100):
         signal, reason = "BUY", f"Price {last_close:.2f} near support {ns_price:.2f} with uptrend"
     elif trend_down and nr_price is not None and last_close >= nr_price * (1 - buffer_pct/100):
         signal, reason = "SELL", f"Price {last_close:.2f} near resistance {nr_price:.2f} with downtrend"
 
-    # Use your SR backtest that includes stop_pct
+    # RUN the SR backtest (10% hard stop supported)
     trades, equity = backtest_sr(
         prices, sr_levels,
         buffer_pct=buffer_pct,
         atr_period=atr_period,
         stop_atr=stop_atr,
         take_atr=take_atr,
-        stop_pct=stop_pct,   # from the SR sidebar slider
+        stop_pct=stop_pct,
     )
 
-# --- Common metrics (always defined from here on) ---
+# --- Common metrics (always compute before rendering header) ---
 win_rate, total_return, n_trades = summarize_trades(trades)
 mdd = max_drawdown(equity)
 dir_stats = directional_breakdown(trades)
 
-# ----------------------------
-# Header signal & metrics
-# ----------------------------
-signal_color = {"BUY": "green", "SELL": "red", "HOLD": "gray"}[signal]
-st.markdown(f"<h2 style='color:{signal_color};'>📢 Live Signal: {signal}</h2>", unsafe_allow_html=True)
-if reason:
-    st.caption(reason)
-
-colA, colB, colC, colD, colE, colF = st.columns([1.4, 1, 1, 1, 1, 1.2])
-colA.markdown(f"### 📊 Current Bias: **{bias}**")
-colB.metric("Win Rate", f"{win_rate:.2f}%")
-colC.metric("Total Return", f"{total_return:+.2f}%")
-colD.metric("Max Drawdown", f"{mdd:.2f}%")
-colE.metric("Trades", f"{n_trades}")
-
-
-# Long vs Short breakdown
-st.write("**Directional breakdown**")
-st.dataframe(pd.DataFrame({
-    "side": ["long","short"],
-    "n": [dir_stats["long"]["n"], dir_stats["short"]["n"]],
-    "win%": [round(dir_stats["long"]["win"],2), round(dir_stats["short"]["win"],2)],
-    "net%": [round(dir_stats["long"]["net"],2), round(dir_stats["short"]["net"],2)],
-}), use_container_width=True)
-
-# ----------------------------
-# Chart
-# ----------------------------
-fig = go.Figure()
-fig.add_trace(go.Candlestick(x=prices.index, open=prices["Open"], high=prices["High"], low=prices["Low"], close=prices["Close"], name="Price"))
-# Always defined even if no setup triggers a signal
-signal, reason = "HOLD", ""
-
-if strategy == "Donchian Breakout":
-    he = plot_series["high_entry"]; le = plot_series["low_entry"]
-    hx = plot_series["high_exit"]; lx = plot_series["low_exit"]
-    ch_l = plot_series["chand_long"]; ch_s = plot_series["chand_short"]
-    sma_long = plot_series["sma_long"]
-    fig.add_trace(go.Scatter(x=he.index, y=he, name=f"{n_entry}D High", mode="lines"))
-    fig.add_trace(go.Scatter(x=le.index, y=le, name=f"{n_entry}D Low", mode="lines"))
-    fig.add_trace(go.Scatter(x=hx.index, y=hx, name=f"{n_exit}D High (exit)", mode="lines", line=dict(dash="dot")))
-    fig.add_trace(go.Scatter(x=lx.index, y=lx, name=f"{n_exit}D Low (exit)", mode="lines", line=dict(dash="dot")))
-    if use_chandelier:
-        fig.add_trace(go.Scatter(x=ch_l.index, y=ch_l, name="Chandelier Long", mode="lines"))
-        fig.add_trace(go.Scatter(x=ch_s.index, y=ch_s, name="Chandelier Short", mode="lines"))
-    if short_gate:
-        fig.add_trace(go.Scatter(x=sma_long.index, y=sma_long, name="SMA200", mode="lines"))
-else:
-    # show SR levels as in your original (optional)
-    pass
-# --- Common metrics (works for both strategies) ---
-win_rate, total_return, n_trades = summarize_trades(trades)
-mdd = max_drawdown(equity)
-dir_stats = directional_breakdown(trades)
 
 # Trade markers
 long_x, long_y, short_x, short_y, exit_x, exit_y = [], [], [], [], [], []
