@@ -595,6 +595,8 @@ res_now = cluster_levels(list(hi_piv.iloc[:cut_live].dropna().values), cluster_t
 
 ns_price = nearest_level(last_close, sup_now)
 nr_price = nearest_level(last_close, res_now)
+# keep these around for the chart
+sr_plot_support, sr_plot_resist = sup_now, res_now
 
 
     # LIVE signal for SR
@@ -751,7 +753,7 @@ fig.add_trace(
         name="Price",
     )
 )
-
+sr_plot_support, sr_plot_resist = None, None
 if strategy == "Donchian Breakout":
     he = plot_series["high_entry"]; le = plot_series["low_entry"]
     hx = plot_series["high_exit"];  lx = plot_series["low_exit"]
@@ -768,24 +770,25 @@ if strategy == "Donchian Breakout":
     if short_gate:
         fig.add_trace(go.Scatter(x=sma_long.index, y=sma_long, name="SMA200", mode="lines"))
 else:
-    # draw SR levels
-# SR zones like the screenshot
-    if show_sr_zones:
+    # SR zones like the screenshot
+    if show_sr_zones and sr_plot_support is not None and sr_plot_resist is not None:
         draw_sr_zones(
             fig,
-            sr_levels.support,
-            sr_levels.resistance,
+            sr_plot_support,
+            sr_plot_resist,
             prices.index,
             pct=zone_pct,
             max_each=max_zones,
             show_midline=show_zone_midline,
         )
     else:
-    # fallback: simple lines
-        for lvl in sr_levels.support:
-            fig.add_hline(y=lvl, line_width=1, line_dash="dot", line_color="green")
-        for lvl in sr_levels.resistance:
-            fig.add_hline(y=lvl, line_width=1, line_dash="dot", line_color="red")
+        # fallback: simple lines (only draw if we actually have levels)
+        if sr_plot_support:
+            for lvl in sr_plot_support:
+                fig.add_hline(y=lvl, line_width=1, line_dash="dot", line_color="green")
+        if sr_plot_resist:
+            for lvl in sr_plot_resist:
+                fig.add_hline(y=lvl, line_width=1, line_dash="dot", line_color="red")
 
 
 # Trade markers (AFTER fig is created)
