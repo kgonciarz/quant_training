@@ -1,4 +1,4 @@
-# cocoa_dashboard.py — Donchian breakout with switchable filters + optimizer
+# coffee_dashboard.py — Donchian breakout with switchable filters + optimizer
 import datetime as dt
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
@@ -13,8 +13,8 @@ from streamlit_autorefresh import st_autorefresh
 TICKER = "KC=F"
 DEFAULT_YEARS = 3
 
-st_autorefresh(interval=60000, key="data_refresh_coffee")
-
+st.set_page_config(page_title="Coffee Dashboard", layout="wide", initial_sidebar_state="expanded")
+st_autorefresh(interval=60000, key="data_refresh")  # 60,000 ms = 60 sec
 
 # ----------------------------
 # Utilities
@@ -313,12 +313,11 @@ def optimize_donchian(prices: pd.DataFrame, *,
 # Sidebar Controls
 # ----------------------------
 with st.sidebar:
-    st.header("Coffee Settings")  # you can keep "Settings" if you want
+    st.header("Coffee Settings")   
     end_default = today_utc()
     start_default = end_default - dt.timedelta(days=365 * DEFAULT_YEARS)
-
-    start_date = st.date_input("Start date", value=start_default, key="coffee_start")
-    end_date   = st.date_input("End date",   value=end_default,   key="coffee_end")
+    start_date = st.date_input("Start date", value=start_default)
+    end_date = st.date_input("End date", value=end_default)
 
     st.subheader("Strategy")
     strategy = st.selectbox("Strategy", ["Donchian Breakout", "S/R Bounce (original)"], index=0)
@@ -326,7 +325,7 @@ with st.sidebar:
     trend_len = st.slider("Trend window for bias (SMA)", 20, 200, 50, step=5)
 
     if strategy == "Donchian Breakout":
-        st.caption("Tip: Cocoa shorts often underperform; try Long-only or gate shorts by 200SMA downtrend.")
+        st.caption("Tip: If shorts underperform, try Long-only or gate shorts by 200SMA downtrend.")
         n_entry = st.slider("Donchian entry (N-high/low)", 10, 60, 20)
         n_exit = st.slider("Donchian exit (opposite N)", 5, 40, 10)
         use_adx = st.checkbox("Use ADX filter", value=True)
@@ -355,7 +354,7 @@ if not auto_refresh:
 if start_date >= end_date:
     st.error("Start date must be before end date."); st.stop()
 
-with st.spinner("Fetching cocoa prices…"):
+with st.spinner("Fetching coffee prices…"):
     prices = get_prices(TICKER, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
 
 if prices.empty:
