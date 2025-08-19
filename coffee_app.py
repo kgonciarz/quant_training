@@ -578,25 +578,6 @@ else:
     hi_piv = rolling_extrema(prices["High"], sr_window, "max")
     lo_piv = rolling_extrema(prices["Low"],  sr_window, "min")
 
-    # Build live S/R levels using only confirmed pivots
-    cut_live = max(0, len(prices) - 1 - half)
-    sup_now = cluster_levels(list(lo_piv.iloc[:cut_live].dropna().values), cluster_tol)
-    res_now = cluster_levels(list(hi_piv.iloc[:cut_live].dropna().values), cluster_tol)
-
-    # keep for plotting later
-    sr_plot_support, sr_plot_resist = sup_now, res_now
-
-    # Live signal (observed on last close)
-    ns_price = nearest_level(last_close, sup_now)
-    nr_price = nearest_level(last_close, res_now)
-
-    trend_up, trend_down = trend_val > 0, trend_val < 0
-    signal, reason = "HOLD", ""
-    if trend_up and ns_price is not None and last_close <= ns_price * (1 + buffer_pct/100):
-        signal, reason = "BUY", f"Price {last_close:.2f} near support {ns_price:.2f} with uptrend"
-    elif trend_down and nr_price is not None and last_close >= nr_price * (1 - buffer_pct/100):
-        signal, reason = "SELL", f"Price {last_close:.2f} near resistance {nr_price:.2f} with downtrend"
-
 
     # ---- SR backtest with 10% hard stop ----
 def backtest_sr(
@@ -768,13 +749,6 @@ sr_plot_support, sr_plot_resist = sup_now, res_now
 
 ns_price = nearest_level(last_close, sup_now)
 nr_price = nearest_level(last_close, res_now)
-
-trend_up, trend_down = trend_val > 0, trend_val < 0
-signal, reason = "HOLD", ""
-if trend_up and ns_price is not None and last_close <= ns_price * (1 + buffer_pct/100):
-    signal, reason = "BUY", f"Price {last_close:.2f} near support {ns_price:.2f} with uptrend"
-elif trend_down and nr_price is not None and last_close >= nr_price * (1 - buffer_pct/100):
-    signal, reason = "SELL", f"Price {last_close:.2f} near resistance {nr_price:.2f} with downtrend"
 
 
 
