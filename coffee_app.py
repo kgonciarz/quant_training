@@ -184,10 +184,12 @@ def backtest_donchian(
     cost_mult = 1 - (slippage_bps + fee_bps)/1e4
 
     # --- robust warm-up: find first bar where inputs are usable ---
+# --- robust warm-up: only require inputs that are actually used ---
     series_list = [high_entry, low_entry, high_exit, low_exit, atr]
     if use_adx:
         series_list.append(adx)
-    if short_trend_gate:
+    # Only gate shorts with SMA; if long_only, or short_trend_gate is False, don't wait for SMA.
+    if short_trend_gate and (not long_only):
         series_list.append(sma_long)
 
     valid_starts = []
@@ -203,14 +205,17 @@ def backtest_donchian(
                 valid_starts.append(int(df.index.get_loc(idx)))
             except KeyError:
                 valid_starts.append(0)
+
     min_lookback = max(
         n_entry,
         n_exit,
         atr_period,
         (adx_period if use_adx else 0),
-        (trend_sma if short_trend_gate else 0),
+        (trend_sma if (short_trend_gate and (not long_only)) else 0),
     )
     start_idx = max(min_lookback, max(valid_starts))
+
+    # Bail out early if we truly don't have enough bars to trade
     if start_idx >= len(df) - 1:
         plot_series = {
             "high_entry": high_entry, "low_entry": low_entry,
@@ -219,6 +224,7 @@ def backtest_donchian(
             "adx": adx, "atr": atr, "sma_long": sma_long,
         }
         return [], pd.Series([1.0], index=[df.index[0]]), plot_series
+
 
     def size_from_atr(eqt: float, a: float) -> float:
         # Notional fraction sized so that 1R ≈ atr_risk_mult*ATR => lose risk_per_trade if stop at 1R
