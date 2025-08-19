@@ -184,11 +184,17 @@ def backtest_donchian(
     cost_mult = 1 - (slippage_bps + fee_bps)/1e4
 
     # --- robust warm-up: find first bar where inputs are usable ---
-    series_list = [high_entry, low_entry, high_exit, low_exit, atr, adx, sma_long]
+    series_list = [high_entry, low_entry, high_exit, low_exit, atr]
+    if use_adx:
+        series_list.append(adx)
+    if short_trend_gate:
+        series_list.append(sma_long)
+
     valid_starts = []
     for s in series_list:
         if s is None or len(s) == 0:
-            valid_starts.append(0); continue
+            valid_starts.append(0)
+            continue
         idx = s.first_valid_index()
         if idx is None:
             valid_starts.append(0)
@@ -197,7 +203,13 @@ def backtest_donchian(
                 valid_starts.append(int(df.index.get_loc(idx)))
             except KeyError:
                 valid_starts.append(0)
-    min_lookback = max(n_entry, n_exit, atr_period, adx_period, trend_sma)
+    min_lookback = max(
+        n_entry,
+        n_exit,
+        atr_period,
+        (adx_period if use_adx else 0),
+        (trend_sma if short_trend_gate else 0),
+    )
     start_idx = max(min_lookback, max(valid_starts))
     if start_idx >= len(df) - 1:
         plot_series = {
