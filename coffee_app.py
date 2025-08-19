@@ -192,11 +192,35 @@ def backtest_donchian(
     cost_mult = 1 - (slippage_bps + fee_bps)/1e4  # applied on entry and exit each
 
     # warmup: first index where everything is finite
-    start_i = max(
-        series.first_valid_index() if (series := s) is not None else df.index[0]
-        for s in [high_entry, low_entry, high_exit, low_exit, atr, adx, sma_long]
-    )
-    start_idx = df.index.get_loc(start_i) if start_i in df.index else max(n_entry, atr_period, adx_period, trend_sma)
+        # --- warmup: find the first bar where all prerequisite series are usable ---
+    series_list = [high_entry, low_entry, high_exit, low_exit, atr, adx, sma_long]
+
+    valid_starts = []
+    for s in series_list:
+        if s is None or len(s) == 0:
+            valid_starts.append(0)
+            continue
+        idx = s.first_valid_index()
+        if idx is None:
+            valid_starts.append(0)
+        else:
+            try:
+                valid_starts.append(int(df.index.get_loc(idx)))
+            except KeyError:
+                valid_starts.append(0)
+
+    min_lookback = max(n_entry, n_exit, atr_period, adx_period, trend_sma)
+    start_idx = max(min_lookback, max(valid_starts))
+
+    if start_idx >= len(df) - 1:
+        plot_series = {
+            "high_entry": high_entry, "low_entry": low_entry,
+            "high_exit": high_exit,   "low_exit": low_exit,
+            "chand_long": chand_long, "chand_short": chand_short,
+            "adx": adx, "atr": atr, "sma_long": sma_long,
+        }
+        return [], pd.Series([1.0], index=[df.index[0]]), plot_series
+
 
     def size_from_atr(eqt: float, a: float) -> float:
         # Notional fraction sized so that 1R ≈ atr_risk_mult*ATR => lose risk_per_trade if stop at 1R
