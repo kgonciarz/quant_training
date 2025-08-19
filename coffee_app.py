@@ -581,93 +581,153 @@ def backtest_sr(
     stop_atr: float = 2.0,
     take_atr: float = 3.0,
     stop_pct: Optional[float] = 10.0,
+    # NEW:
+    risk_per_trade: float = 0.01,      # 1% of equity per trade
+    atr_risk_mult: float = 2.0,        # 1R ~ 2*ATR
+    slippage_bps: float = 2.0,         # each side
+    fee_bps: float = 1.0,              # each side
+    cooldown_days: int = 3,            # wait after exit before next entry
 ) -> Tuple[List[Trade], pd.Series]:
     close = df["Close"].astype(float)
     high  = df["High"].astype(float)
     low   = df["Low"].astype(float)
+    openp = df["Open"].astype(float)
     atr   = compute_atr_sma(df, atr_period)
-    trend = slope(close, 50).reindex(df.index)
 
     trades: List[Trade] = []
     equity, equity_time = [1.0], [df.index[0]]
     position: Optional[Trade] = None
+    qty = 0.0
+    last_exit_i = -1
 
-    for i, (t, px) in enumerate(close.items()):
-        # --- build levels using ONLY confirmed pivots available at time i ---
-        # a centered window needs 'half' future bars to confirm a pivot,
-        # so only use pivots with index <= i - half
+    cost_mult_in  = 1 - (slippage_bps + fee_bps)/1e4
+    cost_mult_out = 1 - (slippage_bps + fee_bps)/1e4
+
+    # centered window half-width (already in your code)
+    half = sr_window // 2 if (sr_window % 2) else (sr_window + 1) // 2
+
+    def cluster_levels(level_values: List[float], tol_pct: float = 0.6) -> List[float]:
+        if not level_values: return []
+        vals = sorted([float(x) for x in level_values if np.isfinite(x)])
+        clusters = []
+        for lv in vals:
+            if not clusters: clusters.append([lv])
+            else:
+                ref = np.mean(clusters[-1])
+                if abs(lv - ref)/ref*100.0 <= tol_pct: clusters[-1].append(lv)
+                else: clusters.append([lv])
+        return [float(np.mean(c)) for c in clusters]
+
+    def nearest_level(price: float, levels: List[float]) -> Optional[float]:
+        if not levels: return None
+        arr = np.array(levels, dtype=float)
+        return float(arr[np.argmin(np.abs(arr - price))])
+
+    def size_from_atr(eq: float, a: float, ref_px: float) -> float:
+        if not np.isfinite(a) or a <= 0: return 0.0
+        r_px = atr_risk_mult * a
+        return min(1.0, max(0.0, (risk_per_trade) / (r_px / ref_px)))  # fraction of equity notionally
+
+    # We will “decide” on bar i and transact at bar i+1 open.
+    for i, (t, px_c) in enumerate(close.iloc[:-1].items()):
+        # Build usable pivots up to i - half (no look-ahead)
         cut = max(0, i - half)
         past_highs = list(hi_piv.iloc[:cut].dropna().values)
         past_lows  = list(lo_piv.iloc[:cut].dropna().values)
         res_levels = cluster_levels(past_highs, cluster_tol)
         sup_levels = cluster_levels(past_lows,  cluster_tol)
 
-        ns = nearest_level(px, sup_levels)
-        nr = nearest_level(px, res_levels)
+        # Trend bias (same as your slope)
+        tr_val = slope(close, trend_len).iloc[i]
+        tr_up, tr_dn = (float(tr_val) if pd.notna(tr_val) else 0.0) > 0, (float(tr_val) if pd.notna(tr_val) else 0.0) < 0
 
-        tr_val = float(trend.iloc[i]) if pd.notna(trend.iloc[i]) else 0.0
-        tr_up, tr_dn = tr_val > 0, tr_val < 0
+        # Near-level check using price-relative buffer
+        ns = nearest_level(px_c, sup_levels)
+        nr = nearest_level(px_c, res_levels)
+        near_sup = (ns is not None) and (px_c <= ns * (1 + buffer_pct/100.0))
+        near_res = (nr is not None) and (px_c >= nr * (1 - buffer_pct/100.0))
 
-        # --- entries ---
+        # Decide what to do at close of bar i
+        pending = None  # ("entry_long"/"entry_short"/"exit")
         if position is None:
-            if tr_up and ns and px <= ns * (1 + buffer_pct/100.0):
-                position = Trade(t, float(px), "long"); trades.append(position)
-            elif tr_dn and nr and px >= nr * (1 - buffer_pct/100.0):
-                position = Trade(t, float(px), "short"); trades.append(position)
+            if i - last_exit_i >= cooldown_days:
+                if tr_up and near_sup:
+                    pending = ("entry_long", ns)
+                elif tr_dn and near_res:
+                    pending = ("entry_short", nr)
         else:
-            a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else 1e-6
-
-            # hard stop (priority 1)
-            if stop_pct is not None:
-                if position.side == "long":
-                    hard_stop = position.entry_price * (1.0 - stop_pct/100.0)
-                    if float(low.iloc[i]) <= hard_stop:
-                        position.exit_time = t
-                        position.exit_price = float(hard_stop)
-                        position.pnl_pct = (hard_stop / position.entry_price - 1) * 100
-                        equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
-                        position = None
-                        continue
-                else:
-                    hard_stop = position.entry_price * (1.0 + stop_pct/100.0)
-                    if float(high.iloc[i]) >= hard_stop:
-                        position.exit_time = t
-                        position.exit_price = float(hard_stop)
-                        position.pnl_pct = (position.entry_price / hard_stop - 1) * 100
-                        equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
-                        position = None
-                        continue
-
-            # ATR stop / take (priority 2)
-            if position is not None:
+            # OCO bracket is evaluated intrabar on the CURRENT bar (i)
+            a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else np.nan
+            if np.isfinite(a) and a > 0:
                 if position.side == "long":
                     stop = position.entry_price - stop_atr * a
                     take = position.entry_price + take_atr * a
-                    if px <= stop or px >= take:
-                        position.exit_time = t
-                        position.exit_price = float(px)
-                        position.pnl_pct = (px / position.entry_price - 1) * 100
-                        equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
-                        position = None
+                    # optional hard stop (dominates)
+                    if stop_pct is not None:
+                        hard = position.entry_price * (1.0 - stop_pct/100.0)
+                        stop = max(stop, hard)
+                    # intrabar path using current bar range
+                    px_l, px_h = float(low.iloc[i]), float(high.iloc[i])
+                    if px_l <= stop:   # stop hit (conservative priority)
+                        fill = stop * cost_mult_out
+                        ret = (fill / position.entry_price - 1)
+                        equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(t)
+                        position.exit_time, position.exit_price, position.pnl_pct = t, float(fill), ret*100
+                        position = None; qty = 0.0; last_exit_i = i
+                    elif px_h >= take:
+                        fill = take * cost_mult_out
+                        ret = (fill / position.entry_price - 1)
+                        equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(t)
+                        position.exit_time, position.exit_price, position.pnl_pct = t, float(fill), ret*100
+                        position = None; qty = 0.0; last_exit_i = i
                 else:
                     stop = position.entry_price + stop_atr * a
                     take = position.entry_price - take_atr * a
-                    if px >= stop or px <= take:
-                        position.exit_time = t
-                        position.exit_price = float(px)
-                        position.pnl_pct = (position.entry_price / px - 1) * 100
-                        equity.append(equity[-1] * (1 + position.pnl_pct/100)); equity_time.append(t)
-                        position = None
+                    if stop_pct is not None:
+                        hard = position.entry_price * (1.0 + stop_pct/100.0)
+                        stop = min(stop, hard)
+                    px_l, px_h = float(low.iloc[i]), float(high.iloc[i])
+                    if px_h >= stop:
+                        # exit worse on costs for short
+                        fill = stop / cost_mult_out
+                        ret = (position.entry_price / fill - 1)
+                        equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(t)
+                        position.exit_time, position.exit_price, position.pnl_pct = t, float(fill), ret*100
+                        position = None; qty = 0.0; last_exit_i = i
+                    elif px_l <= take:
+                        fill = take / cost_mult_out
+                        ret = (position.entry_price / fill - 1)
+                        equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(t)
+                        position.exit_time, position.exit_price, position.pnl_pct = t, float(fill), ret*100
+                        position = None; qty = 0.0; last_exit_i = i
 
-    # close any open trade on the last bar
+        # Execute pending at NEXT bar open (i+1)
+        if pending is not None and position is None:
+            nxt = df.index[i+1]
+            a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else np.nan
+            if pending[0] == "entry_long":
+                fill = float(openp.iloc[i+1]) / cost_mult_in
+                qty = size_from_atr(equity[-1], a, ref_px=fill)
+                position = Trade(nxt, float(fill), "long"); trades.append(position)
+            elif pending[0] == "entry_short":
+                fill = float(openp.iloc[i+1]) * cost_mult_in  # worse for short entry
+                qty = size_from_atr(equity[-1], a, ref_px=fill)
+                position = Trade(nxt, float(fill), "short"); trades.append(position)
+
+    # Close any open position on the last bar’s close with exit costs
     if position is not None:
         last_px = float(close.iloc[-1])
-        pnl = (last_px / position.entry_price - 1) * 100 if position.side == "long" \
-              else (position.entry_price / last_px - 1) * 100
-        position.exit_time, position.exit_price, position.pnl_pct = close.index[-1], last_px, pnl
-        equity.append(equity[-1] * (1 + pnl/100)); equity_time.append(close.index[-1])
+        if position.side == "long":
+            fill = last_px * cost_mult_out
+            ret = (fill / position.entry_price - 1)
+        else:
+            fill = last_px / cost_mult_out
+            ret = (position.entry_price / fill - 1)
+        position.exit_time, position.exit_price, position.pnl_pct = close.index[-1], float(fill), ret*100
+        equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(close.index[-1])
 
     return trades, pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index()
+
 
 
 # Use only history up to the last confirmed pivot (no look-ahead)
