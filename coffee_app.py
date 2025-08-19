@@ -750,6 +750,35 @@ sr_plot_support, sr_plot_resist = sup_now, res_now
 ns_price = nearest_level(last_close, sup_now)
 nr_price = nearest_level(last_close, res_now)
 
+trend_up, trend_down = trend_val > 0, trend_val < 0
+signal, reason = "HOLD", ""
+if trend_up and ns_price is not None and last_close <= ns_price * (1 + buffer_pct/100):
+    signal, reason = "BUY", f"Price {last_close:.2f} near support {ns_price:.2f} with uptrend"
+elif trend_down and nr_price is not None and last_close >= nr_price * (1 - buffer_pct/100):
+    signal, reason = "SELL", f"Price {last_close:.2f} near resistance {nr_price:.2f} with downtrend"
+
+
+
+    # LIVE signal for SR
+trend_up, trend_down = trend_val > 0, trend_val < 0
+if trend_up and ns_price is not None and last_close <= ns_price * (1 + buffer_pct/100):
+    signal, reason = "BUY", f"Price {last_close:.2f} near support {ns_price:.2f} with uptrend"
+elif trend_down and nr_price is not None and last_close >= nr_price * (1 - buffer_pct/100):
+    signal, reason = "SELL", f"Price {last_close:.2f} near resistance {nr_price:.2f} with downtrend"
+
+    # run SR backtest (now defined above)
+trades, equity = backtest_sr(
+        prices,
+        hi_piv=hi_piv,
+        lo_piv=lo_piv,
+        cluster_tol=cluster_tol,
+        buffer_pct=buffer_pct,
+        atr_period=atr_period,
+        stop_atr=stop_atr,
+        take_atr=take_atr,
+        stop_pct=stop_pct,
+)
+
 
 
 # --- Common metrics (compute BEFORE rendering header) ---
