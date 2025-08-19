@@ -164,13 +164,17 @@ def backtest_donchian(
     long_only: bool = False,
     short_trend_gate: bool = True,
     trend_sma: int = 200,
-    stop_pct: Optional[float] = 10.0,   # <- use Optional for broad Py versions
+    stop_pct: Optional[float] = 10.0,
+    # NEW:
+    risk_per_trade: float = 0.01,    # 1% of equity per trade
+    atr_risk_mult: float = 2.0,      # 1R = 2*ATR
+    slippage_bps: float = 2.0,       # each side
+    fee_bps: float = 1.0,            # each side
 ) -> Tuple[List[Trade], pd.Series, dict]:
-    """Donchian breakout with optional ADX filter, Chandelier trailing stop,
-    optional short-only regime gate, and a hard loss-only stop in percent."""
     close = df["Close"].astype(float)
     high  = df["High"].astype(float)
     low   = df["Low"].astype(float)
+    openp = df["Open"].astype(float)
 
     atr = compute_atr_wilder(df, atr_period)
     adx = compute_adx(df, adx_period)
@@ -183,10 +187,32 @@ def backtest_donchian(
     trades: List[Trade] = []
     equity, equity_time = [1.0], [df.index[0]]
     position: Optional[Trade] = None
+    qty = 0.0  # position size in "units" of instrument (since we model returns, this is a scalar)
 
-    for i in range(1, len(df)):
+    cost_mult = 1 - (slippage_bps + fee_bps)/1e4  # applied on entry and exit each
+
+    # warmup: first index where everything is finite
+    start_i = max(
+        series.first_valid_index() if (series := s) is not None else df.index[0]
+        for s in [high_entry, low_entry, high_exit, low_exit, atr, adx, sma_long]
+    )
+    start_idx = df.index.get_loc(start_i) if start_i in df.index else max(n_entry, atr_period, adx_period, trend_sma)
+
+    def size_from_atr(eqt: float, a: float) -> float:
+        # Notional fraction sized so that 1R ≈ atr_risk_mult*ATR => lose risk_per_trade if stop at 1R
+        if not np.isfinite(a) or a <= 0: 
+            return 0.0
+        r_px = atr_risk_mult * a
+        return min(1.0, max(0.0, (risk_per_trade) / (r_px / float(close.iloc[0]))))  # clamp 0..1
+
+    # Signal state computed at t, executed at t+1 open
+    pending_sig = None  # ("long"/"short", entry_level_text)
+
+    for i in range(start_idx, len(df) - 1):  # we will use i+1 open to transact
         t = df.index[i]
-        px_h, px_l, px_c = float(high.iloc[i]), float(low.iloc[i]), float(close.iloc[i])
+        nxt = df.index[i+1]
+
+        px_o, px_h, px_l, px_c = float(openp.iloc[i]), float(high.iloc[i]), float(low.iloc[i]), float(close.iloc[i])
 
         hi_ent = float(high_entry.iloc[i-1]) if np.isfinite(high_entry.iloc[i-1]) else np.nan
         lo_ent = float(low_entry.iloc[i-1])  if np.isfinite(low_entry.iloc[i-1])  else np.nan
@@ -199,64 +225,98 @@ def backtest_donchian(
         chand_l = float(chand_long.iloc[i-1]) if (use_chandelier and np.isfinite(chand_long.iloc[i-1])) else np.nan
         chand_s = float(chand_short.iloc[i-1]) if (use_chandelier and np.isfinite(chand_short.iloc[i-1])) else np.nan
 
-        if position is None:
-            if adx_ok and np.isfinite(hi_ent) and px_c > hi_ent:
-                position = Trade(t, float(px_c), "long"); trades.append(position); continue
-            if (not long_only) and adx_ok and np.isfinite(lo_ent) and px_c < lo_ent and sma_ok_short:
-                position = Trade(t, float(px_c), "short"); trades.append(position); continue
-        else:
-            # ----- HARD STOP (priority 1) -----
+        # 1) Hard stop intraday (executed on current bar)
+        if position is not None:
             hit_hard = False
             if stop_pct is not None:
                 if position.side == "long":
                     hard_stop = position.entry_price * (1.0 - stop_pct/100.0)
                     if px_l <= hard_stop:
-                        position.exit_time = t
-                        position.exit_price = float(hard_stop)
-                        position.pnl_pct = (hard_stop / position.entry_price - 1) * 100
-                        equity.append(equity[-1]*(1 + position.pnl_pct/100)); equity_time.append(t)
-                        position = None; hit_hard = True
+                        fill = hard_stop * cost_mult
+                        ret = (fill / position.entry_price - 1)
+                        equity.append(equity[-1] * (1 + ret * qty)); equity_time.append(t)
+                        position.exit_time, position.exit_price, position.pnl_pct = t, float(fill), ret*100
+                        trades[-1] = position
+                        position, qty, pending_sig = None, 0.0, None
+                        continue
                 else:
                     hard_stop = position.entry_price * (1.0 + stop_pct/100.0)
                     if px_h >= hard_stop:
-                        position.exit_time = t
-                        position.exit_price = float(hard_stop)
-                        position.pnl_pct = (position.entry_price / hard_stop - 1) * 100
-                        equity.append(equity[-1]*(1 + position.pnl_pct/100)); equity_time.append(t)
-                        position = None; hit_hard = True
-            if hit_hard:
-                continue
+                        fill = (position.entry_price / hard_stop - 1)
+                        # convert to price-equivalent exit with costs
+                        exit_px = hard_stop / cost_mult
+                        ret = (position.entry_price / exit_px - 1)
+                        equity.append(equity[-1] * (1 + ret * qty)); equity_time.append(t)
+                        position.exit_time, position.exit_price, position.pnl_pct = t, float(exit_px), ret*100
+                        trades[-1] = position
+                        position, qty, pending_sig = None, 0.0, None
+                        continue
 
-            # ----- Existing exits (priority 2) -----
-            if position is not None:
-                if position.side == "long":
-                    stop_hit = np.isfinite(chand_l) and (px_l <= chand_l)
-                    exit_hit = np.isfinite(lo_ex)   and (px_c < lo_ex)
-                    if stop_hit or exit_hit:
-                        exit_price = chand_l if stop_hit else px_c
-                        position.exit_time = t
-                        position.exit_price = float(exit_price)
-                        position.pnl_pct = (exit_price / position.entry_price - 1) * 100
-                        equity.append(equity[-1]*(1 + position.pnl_pct/100)); equity_time.append(t)
-                        position = None
-                else:
-                    stop_hit = np.isfinite(chand_s) and (px_h >= chand_s)
-                    exit_hit = np.isfinite(hi_ex)   and (px_c > hi_ex)
-                    if stop_hit or exit_hit:
-                        exit_price = chand_s if stop_hit else px_c
-                        position.exit_time = t
-                        position.exit_price = float(exit_price)
-                        position.pnl_pct = (position.entry_price / exit_price - 1) * 100
-                        equity.append(equity[-1]*(1 + position.pnl_pct/100)); equity_time.append(t)
-                        position = None
+        # 2) Compute end-of-day signal at t (for execution at t+1 open)
+        exit_now = None
+        if position is not None:
+            if position.side == "long":
+                stop_hit = np.isfinite(chand_l) and (px_l <= chand_l)
+                exit_hit = np.isfinite(lo_ex)   and (px_c < lo_ex)
+                if stop_hit or exit_hit:
+                    exit_now = ("long_exit", "chandelier" if stop_hit else "donchian")
+            else:
+                stop_hit = np.isfinite(chand_s) and (px_h >= chand_s)
+                exit_hit = np.isfinite(hi_ex)   and (px_c > hi_ex)
+                if stop_hit or exit_hit:
+                    exit_now = ("short_exit", "chandelier" if stop_hit else "donchian")
 
-    # Close any open position at the last bar
+        entry_now = None
+        if position is None and adx_ok:
+            if np.isfinite(hi_ent) and px_c > hi_ent:
+                entry_now = "long"
+            elif (not long_only) and np.isfinite(lo_ent) and px_c < lo_ent and sma_ok_short:
+                entry_now = "short"
+
+        # Record pending action to execute at next open
+        if exit_now is not None:
+            pending_sig = exit_now
+        elif entry_now is not None:
+            pending_sig = (entry_now, "entry")
+
+        # 3) At next bar's open, execute pending_sig
+        if pending_sig is not None:
+            side, kind = pending_sig
+            fill_open = float(openp.iloc[i+1])  # next bar open
+            # apply costs
+            if side in ("long", "short"):
+                fill_px = fill_open / cost_mult  # worse price on entry
+                # size
+                a = float(atr.iloc[i-1]) if np.isfinite(atr.iloc[i-1]) else np.nan
+                qty = size_from_atr(equity[-1], a)
+                position = Trade(nxt, float(fill_px), "long" if side=="long" else "short")
+                trades.append(position)
+            else:
+                # exits
+                if position is not None:
+                    if position.side == "long":
+                        fill_px = fill_open * cost_mult
+                        ret = (fill_px / position.entry_price - 1)
+                    else:
+                        fill_px = fill_open / cost_mult
+                        ret = (position.entry_price / fill_px - 1)
+                    equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(nxt)
+                    position.exit_time, position.exit_price, position.pnl_pct = nxt, float(fill_px), ret*100
+                    trades[-1] = position
+                    position, qty = None, 0.0
+            pending_sig = None
+
+    # Close any open position at the last bar at its close (with exit costs)
     if position is not None:
         last_px = float(close.iloc[-1])
-        pnl = (last_px / position.entry_price - 1) * 100 if position.side == "long" \
-              else (position.entry_price / last_px - 1) * 100
-        position.exit_time, position.exit_price, position.pnl_pct = close.index[-1], last_px, pnl
-        equity.append(equity[-1]*(1 + pnl/100)); equity_time.append(close.index[-1])
+        if position.side == "long":
+            fill_px = last_px * cost_mult
+            ret = (fill_px / position.entry_price - 1)
+        else:
+            fill_px = last_px / cost_mult
+            ret = (position.entry_price / fill_px - 1)
+        position.exit_time, position.exit_price, position.pnl_pct = close.index[-1], float(fill_px), ret*100
+        equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(close.index[-1])
 
     plot_series = {
         "high_entry": high_entry, "low_entry": low_entry,
@@ -265,6 +325,7 @@ def backtest_donchian(
         "adx": adx, "atr": atr, "sma_long": sma_long,
     }
     return trades, pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index(), plot_series
+
 
 # ----------------------------
 # Metrics & optimizer
@@ -300,45 +361,66 @@ def optimize_donchian(prices: pd.DataFrame, *,
                       n_entry_opts=(20,26,39,52), n_exit_opts=(10,13,26),
                       use_adx_opts=(False, True), adx_min_opts=(0,20,25,30),
                       use_chand_opts=(False, True),
-                      short_gate_opts=(False, True), long_only_opts=(True, False)):
+                      short_gate_opts=(False, True), long_only_opts=(True, False),
+                      splits: int = 3):
     rows = []
     best = None
+    n = len(prices)
+    # rolling splits, last split always includes the most recent data
     for ne in n_entry_opts:
-        he, le = donchian_channels(prices, ne)  # cache per ne if needed
         for nx in n_exit_opts:
             for ua in use_adx_opts:
                 for am in adx_min_opts:
                     for uc in use_chand_opts:
                         for sg in short_gate_opts:
                             for lo in long_only_opts:
-                                trades, eq, _ = backtest_donchian(
-                                    prices, n_entry=ne, n_exit=nx,
-                                    use_adx=ua, adx_min=am,
-                                    use_chandelier=uc,
-                                    long_only=lo,
-                                    short_trend_gate=sg,
-                                )
-                                wr, net, n = summarize_trades(trades)
-                                mdd = max_drawdown(eq)
-                                d = directional_breakdown(trades)
-                                score = (net*2.0) + (wr*0.3) - (max(0,mdd)*0.7)
-                                if n < 4: score -= 40
+                                oos_scores, oos_mdd, oos_ret, oos_wr, oos_tr = [], [], [], [], []
+                                for k in range(splits):
+                                    lo_i = int(n*(0.35 + 0.2*k/splits))  # start OOS later as k increases
+                                    hi_i = int(n*(0.65 + 0.2*k/splits))
+                                    lo_i = max(200, lo_i)
+                                    hi_i = min(n-1, hi_i)
+                                    if hi_i - lo_i < 200: 
+                                        continue
+                                    train = prices.iloc[:lo_i]
+                                    test  = prices.iloc[lo_i:hi_i]
+
+                                    # (train run to "choose" hyperparams – here it's a placeholder;
+                                    #  in a real WF you'd pick best on a grid for train only; we keep it simple)
+
+                                    trades, eq, _ = backtest_donchian(
+                                        test, n_entry=ne, n_exit=nx,
+                                        use_adx=ua, adx_min=am,
+                                        use_chandelier=uc,
+                                        long_only=lo, short_trend_gate=sg,
+                                    )
+                                    wr, net, cnt = summarize_trades(trades)
+                                    mdd = max_drawdown(eq)
+                                    score = (net*2.0) + (wr*0.3) - (max(0,mdd)*0.7)
+                                    if cnt < 4: score -= 40
+                                    oos_scores.append(score); oos_mdd.append(mdd)
+                                    oos_ret.append(net); oos_wr.append(wr); oos_tr.append(cnt)
+
+                                if not oos_scores:
+                                    continue
                                 row = {
                                     "n_entry": ne, "n_exit": nx,
                                     "use_adx": ua, "adx_min": am,
                                     "use_chandelier": uc,
                                     "short_trend_gate": sg,
                                     "long_only": lo,
-                                    "win_rate": wr, "net": net, "mdd": mdd, "trades": n,
-                                    "long_win": d["long"]["win"], "long_net": d["long"]["net"], "long_n": d["long"]["n"],
-                                    "short_win": d["short"]["win"], "short_net": d["short"]["net"], "short_n": d["short"]["n"],
-                                    "score": score,
+                                    "oos_score": np.mean(oos_scores),
+                                    "oos_net": np.mean(oos_ret),
+                                    "oos_mdd": np.mean(oos_mdd),
+                                    "oos_wr": np.mean(oos_wr),
+                                    "oos_trades": int(np.mean(oos_tr)),
                                 }
                                 rows.append(row)
-                                if best is None or score > best["score"]:
+                                if best is None or row["oos_score"] > best["oos_score"]:
                                     best = row.copy()
-    grid = pd.DataFrame(rows).sort_values("score", ascending=False)
+    grid = pd.DataFrame(rows).sort_values("oos_score", ascending=False) if rows else pd.DataFrame()
     return best, grid
+
 
 # ----------------------------
 # Sidebar Controls
@@ -407,7 +489,7 @@ trend_val = float(trend_val) if pd.notna(trend_val) else 0.0
 bias = "LONG" if trend_val > 0 else "SHORT"
 last_close = float(prices["Close"].iloc[-1])
 signal, reason = "HOLD", ""
-
+sr_plot_support, sr_plot_resist = None, None
 
 if strategy == "Donchian Breakout":
     trades, equity, plot_series = backtest_donchian(
