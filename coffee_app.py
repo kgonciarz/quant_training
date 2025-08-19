@@ -14,7 +14,6 @@ TICKER = "KC=F"
 DEFAULT_YEARS = 3
 STOP_PCT = 10.0  # fixed hard stop % for every trade
 
-
 st.set_page_config(page_title="Coffee Dashboard", layout="wide", initial_sidebar_state="expanded")
 st_autorefresh(interval=60000, key="data_refresh")  # 60,000 ms = 60 sec
 
@@ -81,27 +80,23 @@ def get_prices(symbol: str, start, end) -> pd.DataFrame:
         f"Yahoo returned no daily data for {symbol} in {start} → {end}. Try a shorter range or click Refresh again."
     )
 
-
 def today_utc():
     return dt.datetime.utcnow().date()
 
 # ----------------------------
 # Indicators & helpers
 # ----------------------------
-
 def compute_atr_sma(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high, low, close = df["High"], df["Low"], df["Close"]
     prev_close = close.shift(1)
     tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.rolling(period, min_periods=1).mean()
 
-
 def compute_atr_wilder(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high, low, close = df["High"], df["Low"], df["Close"]
     prev_close = close.shift(1)
     tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-
 
 @st.cache_data(show_spinner=False)
 def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -120,7 +115,6 @@ def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     adx = dx.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
     return adx.fillna(0.0)
 
-
 def slope(x: pd.Series, period: int = 50) -> pd.Series:
     sma = x.rolling(period, min_periods=period).mean()
     return sma.diff()
@@ -137,18 +131,15 @@ class Trade:
 # ----------------------------
 # Donchian + optional filters
 # ----------------------------
-
 def donchian_channels(df: pd.DataFrame, n: int) -> Tuple[pd.Series, pd.Series]:
     high_n = df["High"].rolling(n, min_periods=n).max()
     low_n = df["Low"].rolling(n, min_periods=n).min()
     return high_n, low_n
 
-
 def chandelier_stops(df: pd.DataFrame, atr: pd.Series, n: int = 22, m: float = 3.0) -> Tuple[pd.Series, pd.Series]:
     long_stop = df["High"].rolling(n, min_periods=n).max() - m * atr
     short_stop = df["Low"].rolling(n, min_periods=n).min() + m * atr
     return long_stop, short_stop
-
 
 def backtest_donchian(
     df: pd.DataFrame,
@@ -187,19 +178,17 @@ def backtest_donchian(
     trades: List[Trade] = []
     equity, equity_time = [1.0], [df.index[0]]
     position: Optional[Trade] = None
-    qty = 0.0  # position size in "units" of instrument (since we model returns, this is a scalar)
+    qty = 0.0  # position size (fractional notional)
 
-    cost_mult = 1 - (slippage_bps + fee_bps)/1e4  # applied on entry and exit each
+    # apply both slippage and fees on each side as a single multiplier
+    cost_mult = 1 - (slippage_bps + fee_bps)/1e4
 
-    # warmup: first index where everything is finite
-        # --- warmup: find the first bar where all prerequisite series are usable ---
+    # --- robust warm-up: find first bar where inputs are usable ---
     series_list = [high_entry, low_entry, high_exit, low_exit, atr, adx, sma_long]
-
     valid_starts = []
     for s in series_list:
         if s is None or len(s) == 0:
-            valid_starts.append(0)
-            continue
+            valid_starts.append(0); continue
         idx = s.first_valid_index()
         if idx is None:
             valid_starts.append(0)
@@ -208,10 +197,8 @@ def backtest_donchian(
                 valid_starts.append(int(df.index.get_loc(idx)))
             except KeyError:
                 valid_starts.append(0)
-
     min_lookback = max(n_entry, n_exit, atr_period, adx_period, trend_sma)
     start_idx = max(min_lookback, max(valid_starts))
-
     if start_idx >= len(df) - 1:
         plot_series = {
             "high_entry": high_entry, "low_entry": low_entry,
@@ -221,22 +208,21 @@ def backtest_donchian(
         }
         return [], pd.Series([1.0], index=[df.index[0]]), plot_series
 
-
     def size_from_atr(eqt: float, a: float) -> float:
         # Notional fraction sized so that 1R ≈ atr_risk_mult*ATR => lose risk_per_trade if stop at 1R
-        if not np.isfinite(a) or a <= 0: 
+        if not np.isfinite(a) or a <= 0:
             return 0.0
         r_px = atr_risk_mult * a
-        return min(1.0, max(0.0, (risk_per_trade) / (r_px / float(close.iloc[0]))))  # clamp 0..1
+        # use initial price as ref notional scale (keeps fraction in [0,1])
+        return min(1.0, max(0.0, (risk_per_trade) / (r_px / float(close.iloc[0]))))
 
-    # Signal state computed at t, executed at t+1 open
-    pending_sig = None  # ("long"/"short", entry_level_text)
+    pending_sig = None  # ("long"/"short") or ("long_exit"/"short_exit", reason)
 
-    for i in range(start_idx, len(df) - 1):  # we will use i+1 open to transact
+    for i in range(start_idx, len(df) - 1):  # we execute at i+1 open
         t = df.index[i]
         nxt = df.index[i+1]
 
-        px_o, px_h, px_l, px_c = float(openp.iloc[i]), float(high.iloc[i]), float(low.iloc[i]), float(close.iloc[i])
+        px_h, px_l, px_c = float(high.iloc[i]), float(low.iloc[i]), float(close.iloc[i])
 
         hi_ent = float(high_entry.iloc[i-1]) if np.isfinite(high_entry.iloc[i-1]) else np.nan
         lo_ent = float(low_entry.iloc[i-1])  if np.isfinite(low_entry.iloc[i-1])  else np.nan
@@ -249,34 +235,30 @@ def backtest_donchian(
         chand_l = float(chand_long.iloc[i-1]) if (use_chandelier and np.isfinite(chand_long.iloc[i-1])) else np.nan
         chand_s = float(chand_short.iloc[i-1]) if (use_chandelier and np.isfinite(chand_short.iloc[i-1])) else np.nan
 
-        # 1) Hard stop intraday (executed on current bar)
-        if position is not None:
-            hit_hard = False
-            if stop_pct is not None:
-                if position.side == "long":
-                    hard_stop = position.entry_price * (1.0 - stop_pct/100.0)
-                    if px_l <= hard_stop:
-                        fill = hard_stop * cost_mult
-                        ret = (fill / position.entry_price - 1)
-                        equity.append(equity[-1] * (1 + ret * qty)); equity_time.append(t)
-                        position.exit_time, position.exit_price, position.pnl_pct = t, float(fill), ret*100
-                        trades[-1] = position
-                        position, qty, pending_sig = None, 0.0, None
-                        continue
-                else:
-                    hard_stop = position.entry_price * (1.0 + stop_pct/100.0)
-                    if px_h >= hard_stop:
-                        fill = (position.entry_price / hard_stop - 1)
-                        # convert to price-equivalent exit with costs
-                        exit_px = hard_stop / cost_mult
-                        ret = (position.entry_price / exit_px - 1)
-                        equity.append(equity[-1] * (1 + ret * qty)); equity_time.append(t)
-                        position.exit_time, position.exit_price, position.pnl_pct = t, float(exit_px), ret*100
-                        trades[-1] = position
-                        position, qty, pending_sig = None, 0.0, None
-                        continue
+        # 1) Intraday hard stop (acts on current bar)
+        if position is not None and stop_pct is not None:
+            if position.side == "long":
+                hard_stop = position.entry_price * (1.0 - stop_pct/100.0)
+                if px_l <= hard_stop:
+                    fill = hard_stop * cost_mult
+                    ret = (fill / position.entry_price - 1)
+                    equity.append(equity[-1] * (1 + ret * qty)); equity_time.append(t)
+                    position.exit_time, position.exit_price, position.pnl_pct = t, float(fill), ret*100
+                    trades[-1] = position
+                    position, qty, pending_sig = None, 0.0, None
+                    continue
+            else:
+                hard_stop = position.entry_price * (1.0 + stop_pct/100.0)
+                if px_h >= hard_stop:
+                    exit_px = hard_stop / cost_mult  # worse for short stop
+                    ret = (position.entry_price / exit_px - 1)
+                    equity.append(equity[-1] * (1 + ret * qty)); equity_time.append(t)
+                    position.exit_time, position.exit_price, position.pnl_pct = t, float(exit_px), ret*100
+                    trades[-1] = position
+                    position, qty, pending_sig = None, 0.0, None
+                    continue
 
-        # 2) Compute end-of-day signal at t (for execution at t+1 open)
+        # 2) End-of-day signal (execute next open)
         exit_now = None
         if position is not None:
             if position.side == "long":
@@ -297,26 +279,23 @@ def backtest_donchian(
             elif (not long_only) and np.isfinite(lo_ent) and px_c < lo_ent and sma_ok_short:
                 entry_now = "short"
 
-        # Record pending action to execute at next open
         if exit_now is not None:
             pending_sig = exit_now
         elif entry_now is not None:
             pending_sig = (entry_now, "entry")
 
-        # 3) At next bar's open, execute pending_sig
+        # 3) Execute at next bar's open
         if pending_sig is not None:
-            side, kind = pending_sig
-            fill_open = float(openp.iloc[i+1])  # next bar open
-            # apply costs
+            side, _ = pending_sig
+            fill_open = float(openp.iloc[i+1])
+
             if side in ("long", "short"):
-                fill_px = fill_open / cost_mult  # worse price on entry
-                # size
+                fill_px = fill_open / cost_mult  # worse entry
                 a = float(atr.iloc[i-1]) if np.isfinite(atr.iloc[i-1]) else np.nan
                 qty = size_from_atr(equity[-1], a)
-                position = Trade(nxt, float(fill_px), "long" if side=="long" else "short")
+                position = Trade(nxt, float(fill_px), "long" if side == "long" else "short")
                 trades.append(position)
             else:
-                # exits
                 if position is not None:
                     if position.side == "long":
                         fill_px = fill_open * cost_mult
@@ -324,13 +303,13 @@ def backtest_donchian(
                     else:
                         fill_px = fill_open / cost_mult
                         ret = (position.entry_price / fill_px - 1)
-                    equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(nxt)
+                    equity.append(equity[-1] * (1 + ret * qty)); equity_time.append(nxt)
                     position.exit_time, position.exit_price, position.pnl_pct = nxt, float(fill_px), ret*100
                     trades[-1] = position
                     position, qty = None, 0.0
             pending_sig = None
 
-    # Close any open position at the last bar at its close (with exit costs)
+    # Close any open position on the last bar at its close (with exit costs)
     if position is not None:
         last_px = float(close.iloc[-1])
         if position.side == "long":
@@ -340,7 +319,7 @@ def backtest_donchian(
             fill_px = last_px / cost_mult
             ret = (position.entry_price / fill_px - 1)
         position.exit_time, position.exit_price, position.pnl_pct = close.index[-1], float(fill_px), ret*100
-        equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(close.index[-1])
+        equity.append(equity[-1] * (1 + ret * qty)); equity_time.append(close.index[-1])
 
     plot_series = {
         "high_entry": high_entry, "low_entry": low_entry,
@@ -350,15 +329,12 @@ def backtest_donchian(
     }
     return trades, pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index(), plot_series
 
-
 # ----------------------------
 # Metrics & optimizer
 # ----------------------------
-
 def max_drawdown(eq: pd.Series) -> float:
     if eq.empty: return 0.0
     return float(((eq / eq.cummax()) - 1).min() * 100)
-
 
 def summarize_trades(trades: List[Trade]) -> Tuple[float, float, int]:
     closed = [t for t in trades if t.pnl_pct is not None]
@@ -367,7 +343,6 @@ def summarize_trades(trades: List[Trade]) -> Tuple[float, float, int]:
     total_ret = 1.0
     for t in closed: total_ret *= (1 + t.pnl_pct / 100)
     return win_rate, (total_ret - 1) * 100, len(closed)
-
 
 def directional_breakdown(trades: List[Trade]) -> dict:
     longs = [t for t in trades if t.pnl_pct is not None and t.side == "long"]
@@ -380,7 +355,6 @@ def directional_breakdown(trades: List[Trade]) -> dict:
         return {"n":len(ts), "win":wr, "net":(net-1)*100}
     return {"long": _stats(longs), "short": _stats(shorts)}
 
-
 def optimize_donchian(prices: pd.DataFrame, *,
                       n_entry_opts=(20,26,39,52), n_exit_opts=(10,13,26),
                       use_adx_opts=(False, True), adx_min_opts=(0,20,25,30),
@@ -390,7 +364,6 @@ def optimize_donchian(prices: pd.DataFrame, *,
     rows = []
     best = None
     n = len(prices)
-    # rolling splits, last split always includes the most recent data
     for ne in n_entry_opts:
         for nx in n_exit_opts:
             for ua in use_adx_opts:
@@ -400,18 +373,13 @@ def optimize_donchian(prices: pd.DataFrame, *,
                             for lo in long_only_opts:
                                 oos_scores, oos_mdd, oos_ret, oos_wr, oos_tr = [], [], [], [], []
                                 for k in range(splits):
-                                    lo_i = int(n*(0.35 + 0.2*k/splits))  # start OOS later as k increases
+                                    lo_i = int(n*(0.35 + 0.2*k/splits))
                                     hi_i = int(n*(0.65 + 0.2*k/splits))
                                     lo_i = max(200, lo_i)
                                     hi_i = min(n-1, hi_i)
-                                    if hi_i - lo_i < 200: 
+                                    if hi_i - lo_i < 200:
                                         continue
-                                    train = prices.iloc[:lo_i]
                                     test  = prices.iloc[lo_i:hi_i]
-
-                                    # (train run to "choose" hyperparams – here it's a placeholder;
-                                    #  in a real WF you'd pick best on a grid for train only; we keep it simple)
-
                                     trades, eq, _ = backtest_donchian(
                                         test, n_entry=ne, n_exit=nx,
                                         use_adx=ua, adx_min=am,
@@ -424,7 +392,6 @@ def optimize_donchian(prices: pd.DataFrame, *,
                                     if cnt < 4: score -= 40
                                     oos_scores.append(score); oos_mdd.append(mdd)
                                     oos_ret.append(net); oos_wr.append(wr); oos_tr.append(cnt)
-
                                 if not oos_scores:
                                     continue
                                 row = {
@@ -445,17 +412,15 @@ def optimize_donchian(prices: pd.DataFrame, *,
     grid = pd.DataFrame(rows).sort_values("oos_score", ascending=False) if rows else pd.DataFrame()
     return best, grid
 
-
 # ----------------------------
 # Sidebar Controls
 # ----------------------------
 with st.sidebar:
-    st.header("Coffee Settings")   
+    st.header("Coffee Settings")
     end_default = today_utc()
     start_default = end_default - dt.timedelta(days=365 * DEFAULT_YEARS)
     start_date = st.date_input("Start date", value=start_default)
     end_date = st.date_input("End date", value=end_default)
-
 
     st.subheader("Strategy")
     strategy = st.selectbox("Strategy", ["S/R Bounce (original)", "Donchian Breakout"], index=0)
@@ -479,16 +444,15 @@ with st.sidebar:
         sr_window = st.slider("Pivot window (bars)", 15, 61, 25, step=2)
         cluster_tol = st.slider("SR cluster tolerance (%)", 0.1, 1.5, 0.6, step=0.1)
         buffer_pct = st.slider("Entry buffer around SR (%)", 0.0, 1.5, 0.3, step=0.1)
-        atr_period = st.slider("ATR period", 5, 30, 14)
+        atr_period_sr = st.slider("ATR period", 5, 30, 14)
         stop_atr = st.slider("Stop Loss (×ATR)", 0.5, 5.0, 2.0, step=0.1)
         take_atr = st.slider("Take Profit (×ATR)", 0.5, 8.0, 3.0, step=0.1)
-        stop_pct   = st.slider("Hard stop (%)", 2.0, 20.0, 10.0, step=0.5, key="stop_pct_sr")
+        stop_pct_sr = st.slider("Hard stop (%)", 2.0, 20.0, 10.0, step=0.5, key="stop_pct_sr")
         # Visuals for SR zones
         show_sr_zones = st.checkbox("Show SR zones", True)
         zone_pct = st.slider("SR zone width (%)", 0.1, 3.0, 0.6, step=0.1)
         max_zones = st.slider("Max zones each side", 1, 8, 3)
         show_zone_midline = st.checkbox("Show zone midline", True)
-
         optimize_sr = st.button("🧪 Optimize SR")
 
     auto_refresh = st.checkbox("Auto-refresh every 60s", value=True)
@@ -523,10 +487,10 @@ if strategy == "Donchian Breakout":
         adx_period=14, adx_min=adx_min, use_adx=use_adx,
         use_chandelier=use_chandelier,
         long_only=long_only, short_trend_gate=short_gate, trend_sma=200,
-        stop_pct=STOP_PCT,   # from sidebar
+        stop_pct=STOP_PCT,
     )
 
-    # Live signal from prior bar
+    # Live signal from prior bar (observed on last close)
     he, le, adx_s = plot_series["high_entry"], plot_series["low_entry"], plot_series["adx"]
     he_prev = float(he.iloc[-2]) if len(he) >= 2 and np.isfinite(he.iloc[-2]) else np.nan
     le_prev = float(le.iloc[-2]) if len(le) >= 2 and np.isfinite(le.iloc[-2]) else np.nan
@@ -537,7 +501,7 @@ if strategy == "Donchian Breakout":
         signal, reason = "SELL", f"Close {last_close:.2f} < {n_entry}-day low {le_prev:.2f}" + (f" (ADX≥{adx_min:.0f})" if use_adx else "")
 
 else:
-    # ---- S/R utilities & backtest are defined BEFORE calling them ----
+    # ---- S/R utilities & backtest (scoped to this branch) ----
     @dataclass
     class SRLevels:
         support: List[float]
@@ -566,220 +530,186 @@ else:
                 else: clusters.append([lv])
         return [float(np.mean(c)) for c in clusters]
 
-
     def nearest_level(price: float, levels: List[float]) -> Optional[float]:
         if not levels: return None
         arr = np.array(levels, dtype=float)
         return float(arr[np.argmin(np.abs(arr - price))])
-    
-    half = sr_window // 2 if (sr_window % 2) else (sr_window + 1) // 2
 
-    # Centered pivots (use only up to i - half inside the loop/live signal to avoid look-ahead)
+    half = sr_window // 2 if (sr_window % 2) else (sr_window + 1) // 2
     hi_piv = rolling_extrema(prices["High"], sr_window, "max")
     lo_piv = rolling_extrema(prices["Low"],  sr_window, "min")
 
+    # Build live S/R levels using only confirmed pivots
+    cut_live = max(0, len(prices) - 1 - half)
+    sup_now = cluster_levels(list(lo_piv.iloc[:cut_live].dropna().values), cluster_tol)
+    res_now = cluster_levels(list(hi_piv.iloc[:cut_live].dropna().values), cluster_tol)
+    sr_plot_support, sr_plot_resist = sup_now, res_now
 
-    # ---- SR backtest with 10% hard stop ----
-def backtest_sr(
-    df: pd.DataFrame,
-    hi_piv: pd.Series,
-    lo_piv: pd.Series,
-    cluster_tol: float,
-    buffer_pct: float = 0.3,
-    atr_period: int = 14,
-    stop_atr: float = 2.0,
-    take_atr: float = 3.0,
-    stop_pct: Optional[float] = 10.0,
-    # NEW:
-    risk_per_trade: float = 0.01,      # 1% of equity per trade
-    atr_risk_mult: float = 2.0,        # 1R ~ 2*ATR
-    slippage_bps: float = 2.0,         # each side
-    fee_bps: float = 1.0,              # each side
-    cooldown_days: int = 3,            # wait after exit before next entry
-) -> Tuple[List[Trade], pd.Series]:
-    close = df["Close"].astype(float)
-    high  = df["High"].astype(float)
-    low   = df["Low"].astype(float)
-    openp = df["Open"].astype(float)
-    atr   = compute_atr_sma(df, atr_period)
+    ns_price = nearest_level(last_close, sup_now)
+    nr_price = nearest_level(last_close, res_now)
 
-    trades: List[Trade] = []
-    equity, equity_time = [1.0], [df.index[0]]
-    position: Optional[Trade] = None
-    qty = 0.0
-    last_exit_i = -1
+    trend_up, trend_down = trend_val > 0, trend_val < 0
+    signal, reason = "HOLD", ""
+    if trend_up and ns_price is not None and last_close <= ns_price * (1 + buffer_pct/100):
+        signal, reason = "BUY", f"Price {last_close:.2f} near support {ns_price:.2f} with uptrend"
+    elif trend_down and nr_price is not None and last_close >= nr_price * (1 - buffer_pct/100):
+        signal, reason = "SELL", f"Price {last_close:.2f} near resistance {nr_price:.2f} with downtrend"
 
-    cost_mult_in  = 1 - (slippage_bps + fee_bps)/1e4
-    cost_mult_out = 1 - (slippage_bps + fee_bps)/1e4
+    # ---- S/R backtest (next-bar + risk sizing) ----
+    def backtest_sr(
+        df: pd.DataFrame,
+        hi_piv: pd.Series,
+        lo_piv: pd.Series,
+        cluster_tol: float,
+        buffer_pct: float = 0.3,
+        atr_period: int = 14,
+        stop_atr: float = 2.0,
+        take_atr: float = 3.0,
+        stop_pct: Optional[float] = 10.0,
+        risk_per_trade: float = 0.01,
+        atr_risk_mult: float = 2.0,
+        slippage_bps: float = 2.0,
+        fee_bps: float = 1.0,
+        cooldown_days: int = 3,
+        half: int = 10,
+    ) -> Tuple[List[Trade], pd.Series]:
+        close = df["Close"].astype(float)
+        high  = df["High"].astype(float)
+        low   = df["Low"].astype(float)
+        openp = df["Open"].astype(float)
+        atr   = compute_atr_sma(df, atr_period)
 
-    # centered window half-width (already in your code)
-    half = sr_window // 2 if (sr_window % 2) else (sr_window + 1) // 2
+        trades: List[Trade] = []
+        equity, equity_time = [1.0], [df.index[0]]
+        position: Optional[Trade] = None
+        qty = 0.0
+        last_exit_i = -1
 
-    def cluster_levels(level_values: List[float], tol_pct: float = 0.6) -> List[float]:
-        if not level_values: return []
-        vals = sorted([float(x) for x in level_values if np.isfinite(x)])
-        clusters = []
-        for lv in vals:
-            if not clusters: clusters.append([lv])
-            else:
-                ref = np.mean(clusters[-1])
-                if abs(lv - ref)/ref*100.0 <= tol_pct: clusters[-1].append(lv)
-                else: clusters.append([lv])
-        return [float(np.mean(c)) for c in clusters]
+        cost_mult_in  = 1 - (slippage_bps + fee_bps)/1e4
+        cost_mult_out = 1 - (slippage_bps + fee_bps)/1e4
 
-    def nearest_level(price: float, levels: List[float]) -> Optional[float]:
-        if not levels: return None
-        arr = np.array(levels, dtype=float)
-        return float(arr[np.argmin(np.abs(arr - price))])
-
-    def size_from_atr(eq: float, a: float, ref_px: float) -> float:
-        if not np.isfinite(a) or a <= 0: return 0.0
-        r_px = atr_risk_mult * a
-        return min(1.0, max(0.0, (risk_per_trade) / (r_px / ref_px)))  # fraction of equity notionally
-
-    # We will “decide” on bar i and transact at bar i+1 open.
-    for i, (t, px_c) in enumerate(close.iloc[:-1].items()):
-        # Build usable pivots up to i - half (no look-ahead)
-        cut = max(0, i - half)
-        past_highs = list(hi_piv.iloc[:cut].dropna().values)
-        past_lows  = list(lo_piv.iloc[:cut].dropna().values)
-        res_levels = cluster_levels(past_highs, cluster_tol)
-        sup_levels = cluster_levels(past_lows,  cluster_tol)
-
-        # Trend bias (same as your slope)
-        tr_val = slope(close, trend_len).iloc[i]
-        tr_up, tr_dn = (float(tr_val) if pd.notna(tr_val) else 0.0) > 0, (float(tr_val) if pd.notna(tr_val) else 0.0) < 0
-
-        # Near-level check using price-relative buffer
-        ns = nearest_level(px_c, sup_levels)
-        nr = nearest_level(px_c, res_levels)
-        near_sup = (ns is not None) and (px_c <= ns * (1 + buffer_pct/100.0))
-        near_res = (nr is not None) and (px_c >= nr * (1 - buffer_pct/100.0))
-
-        # Decide what to do at close of bar i
-        pending = None  # ("entry_long"/"entry_short"/"exit")
-        if position is None:
-            if i - last_exit_i >= cooldown_days:
-                if tr_up and near_sup:
-                    pending = ("entry_long", ns)
-                elif tr_dn and near_res:
-                    pending = ("entry_short", nr)
-        else:
-            # OCO bracket is evaluated intrabar on the CURRENT bar (i)
-            a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else np.nan
-            if np.isfinite(a) and a > 0:
-                if position.side == "long":
-                    stop = position.entry_price - stop_atr * a
-                    take = position.entry_price + take_atr * a
-                    # optional hard stop (dominates)
-                    if stop_pct is not None:
-                        hard = position.entry_price * (1.0 - stop_pct/100.0)
-                        stop = max(stop, hard)
-                    # intrabar path using current bar range
-                    px_l, px_h = float(low.iloc[i]), float(high.iloc[i])
-                    if px_l <= stop:   # stop hit (conservative priority)
-                        fill = stop * cost_mult_out
-                        ret = (fill / position.entry_price - 1)
-                        equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(t)
-                        position.exit_time, position.exit_price, position.pnl_pct = t, float(fill), ret*100
-                        position = None; qty = 0.0; last_exit_i = i
-                    elif px_h >= take:
-                        fill = take * cost_mult_out
-                        ret = (fill / position.entry_price - 1)
-                        equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(t)
-                        position.exit_time, position.exit_price, position.pnl_pct = t, float(fill), ret*100
-                        position = None; qty = 0.0; last_exit_i = i
+        def _cluster(vals: List[float], tol_pct: float) -> List[float]:
+            if not vals: return []
+            vs = sorted([float(x) for x in vals if np.isfinite(x)])
+            clusters = []
+            for lv in vs:
+                if not clusters: clusters.append([lv])
                 else:
-                    stop = position.entry_price + stop_atr * a
-                    take = position.entry_price - take_atr * a
-                    if stop_pct is not None:
-                        hard = position.entry_price * (1.0 + stop_pct/100.0)
-                        stop = min(stop, hard)
-                    px_l, px_h = float(low.iloc[i]), float(high.iloc[i])
-                    if px_h >= stop:
-                        # exit worse on costs for short
-                        fill = stop / cost_mult_out
-                        ret = (position.entry_price / fill - 1)
-                        equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(t)
-                        position.exit_time, position.exit_price, position.pnl_pct = t, float(fill), ret*100
-                        position = None; qty = 0.0; last_exit_i = i
-                    elif px_l <= take:
-                        fill = take / cost_mult_out
-                        ret = (position.entry_price / fill - 1)
-                        equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(t)
-                        position.exit_time, position.exit_price, position.pnl_pct = t, float(fill), ret*100
-                        position = None; qty = 0.0; last_exit_i = i
+                    ref = np.mean(clusters[-1])
+                    if abs(lv - ref)/ref*100.0 <= tol_pct: clusters[-1].append(lv)
+                    else: clusters.append([lv])
+            return [float(np.mean(c)) for c in clusters]
 
-        # Execute pending at NEXT bar open (i+1)
-        if pending is not None and position is None:
-            nxt = df.index[i+1]
-            a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else np.nan
-            if pending[0] == "entry_long":
-                fill = float(openp.iloc[i+1]) / cost_mult_in
-                qty = size_from_atr(equity[-1], a, ref_px=fill)
-                position = Trade(nxt, float(fill), "long"); trades.append(position)
-            elif pending[0] == "entry_short":
-                fill = float(openp.iloc[i+1]) * cost_mult_in  # worse for short entry
-                qty = size_from_atr(equity[-1], a, ref_px=fill)
-                position = Trade(nxt, float(fill), "short"); trades.append(position)
+        def _nearest(price: float, levels: List[float]) -> Optional[float]:
+            if not levels: return None
+            arr = np.array(levels, dtype=float)
+            return float(arr[np.argmin(np.abs(arr - price))])
 
-    # Close any open position on the last bar’s close with exit costs
-    if position is not None:
-        last_px = float(close.iloc[-1])
-        if position.side == "long":
-            fill = last_px * cost_mult_out
-            ret = (fill / position.entry_price - 1)
-        else:
-            fill = last_px / cost_mult_out
-            ret = (position.entry_price / fill - 1)
-        position.exit_time, position.exit_price, position.pnl_pct = close.index[-1], float(fill), ret*100
-        equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(close.index[-1])
+        def size_from_atr(eq: float, a: float, ref_px: float) -> float:
+            if not np.isfinite(a) or a <= 0: return 0.0
+            r_px = atr_risk_mult * a
+            return min(1.0, max(0.0, (risk_per_trade) / (r_px / ref_px)))
 
-    return trades, pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index()
+        for i, (t, px_c) in enumerate(close.iloc[:-1].items()):
+            # Build usable pivots up to i - half (no look-ahead)
+            cut = max(0, i - half)
+            res_levels = _cluster(list(hi_piv.iloc[:cut].dropna().values), cluster_tol)
+            sup_levels = _cluster(list(lo_piv.iloc[:cut].dropna().values), cluster_tol)
 
+            tr_val = slope(close, trend_len).iloc[i]
+            tr_up, tr_dn = (float(tr_val) if pd.notna(tr_val) else 0.0) > 0, (float(tr_val) if pd.notna(tr_val) else 0.0) < 0
 
+            ns = _nearest(px_c, sup_levels)
+            nr = _nearest(px_c, res_levels)
+            near_sup = (ns is not None) and (px_c <= ns * (1 + buffer_pct/100.0))
+            near_res = (nr is not None) and (px_c >= nr * (1 - buffer_pct/100.0))
 
-# Use only history up to the last confirmed pivot (no look-ahead)
-cut_live = max(0, len(prices) - 1 - half)
-sup_now = cluster_levels(list(lo_piv.iloc[:cut_live].dropna().values), cluster_tol)
-res_now = cluster_levels(list(hi_piv.iloc[:cut_live].dropna().values), cluster_tol)
+            pending = None
+            if position is None:
+                if i - last_exit_i >= cooldown_days:
+                    if tr_up and near_sup:
+                        pending = ("entry_long", ns)
+                    elif tr_dn and near_res:
+                        pending = ("entry_short", nr)
+            else:
+                a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else np.nan
+                if np.isfinite(a) and a > 0:
+                    if position.side == "long":
+                        stop = position.entry_price - stop_atr * a
+                        take = position.entry_price + take_atr * a
+                        if stop_pct is not None:
+                            hard = position.entry_price * (1.0 - stop_pct/100.0)
+                            stop = max(stop, hard)
+                        px_l, px_h = float(low.iloc[i]), float(high.iloc[i])
+                        if px_l <= stop:
+                            fill = stop * cost_mult_out
+                            ret = (fill / position.entry_price - 1)
+                            equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(t)
+                            position.exit_time, position.exit_price, position.pnl_pct = t, float(fill), ret*100
+                            position = None; qty = 0.0; last_exit_i = i
+                        elif px_h >= take:
+                            fill = take * cost_mult_out
+                            ret = (fill / position.entry_price - 1)
+                            equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(t)
+                            position.exit_time, position.exit_price, position.pnl_pct = t, float(fill), ret*100
+                            position = None; qty = 0.0; last_exit_i = i
+                    else:
+                        stop = position.entry_price + stop_atr * a
+                        take = position.entry_price - take_atr * a
+                        if stop_pct is not None:
+                            hard = position.entry_price * (1.0 + stop_pct/100.0)
+                            stop = min(stop, hard)
+                        px_l, px_h = float(low.iloc[i]), float(high.iloc[i])
+                        if px_h >= stop:
+                            fill = stop / cost_mult_out
+                            ret = (position.entry_price / fill - 1)
+                            equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(t)
+                            position.exit_time, position.exit_price, position.pnl_pct = t, float(fill), ret*100
+                            position = None; qty = 0.0; last_exit_i = i
+                        elif px_l <= take:
+                            fill = take / cost_mult_out
+                            ret = (position.entry_price / fill - 1)
+                            equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(t)
+                            position.exit_time, position.exit_price, position.pnl_pct = t, float(fill), ret*100
+                            position = None; qty = 0.0; last_exit_i = i
 
-# keep for plotting later
-sr_plot_support, sr_plot_resist = sup_now, res_now
+            if pending is not None and position is None:
+                nxt = df.index[i+1]
+                a = float(atr.iloc[i]) if np.isfinite(atr.iloc[i]) else np.nan
+                if pending[0] == "entry_long":
+                    fill = float(openp.iloc[i+1]) / cost_mult_in
+                    qty = size_from_atr(equity[-1], a, ref_px=fill)
+                    position = Trade(nxt, float(fill), "long"); trades.append(position)
+                elif pending[0] == "entry_short":
+                    fill = float(openp.iloc[i+1]) * cost_mult_in  # worse for short entry
+                    qty = size_from_atr(equity[-1], a, ref_px=fill)
+                    position = Trade(nxt, float(fill), "short"); trades.append(position)
 
-ns_price = nearest_level(last_close, sup_now)
-nr_price = nearest_level(last_close, res_now)
+        if position is not None:
+            last_px = float(close.iloc[-1])
+            if position.side == "long":
+                fill = last_px * cost_mult_out
+                ret = (fill / position.entry_price - 1)
+            else:
+                fill = last_px / cost_mult_out
+                ret = (position.entry_price / fill - 1)
+            position.exit_time, position.exit_price, position.pnl_pct = close.index[-1], float(fill), ret*100
+            equity.append(equity[-1]*(1 + ret*qty)); equity_time.append(close.index[-1])
 
-trend_up, trend_down = trend_val > 0, trend_val < 0
-signal, reason = "HOLD", ""
-if trend_up and ns_price is not None and last_close <= ns_price * (1 + buffer_pct/100):
-    signal, reason = "BUY", f"Price {last_close:.2f} near support {ns_price:.2f} with uptrend"
-elif trend_down and nr_price is not None and last_close >= nr_price * (1 - buffer_pct/100):
-    signal, reason = "SELL", f"Price {last_close:.2f} near resistance {nr_price:.2f} with downtrend"
+        return trades, pd.Series(equity, index=pd.to_datetime(equity_time)).sort_index()
 
-
-
-    # LIVE signal for SR
-trend_up, trend_down = trend_val > 0, trend_val < 0
-if trend_up and ns_price is not None and last_close <= ns_price * (1 + buffer_pct/100):
-    signal, reason = "BUY", f"Price {last_close:.2f} near support {ns_price:.2f} with uptrend"
-elif trend_down and nr_price is not None and last_close >= nr_price * (1 - buffer_pct/100):
-    signal, reason = "SELL", f"Price {last_close:.2f} near resistance {nr_price:.2f} with downtrend"
-
-    # run SR backtest (now defined above)
-trades, equity = backtest_sr(
+    trades, equity = backtest_sr(
         prices,
         hi_piv=hi_piv,
         lo_piv=lo_piv,
         cluster_tol=cluster_tol,
         buffer_pct=buffer_pct,
-        atr_period=atr_period,
+        atr_period=atr_period_sr,
         stop_atr=stop_atr,
         take_atr=take_atr,
-        stop_pct=stop_pct,
-)
-
-
+        stop_pct=stop_pct_sr,
+        half=half,
+    )
 
 # --- Common metrics (compute BEFORE rendering header) ---
 win_rate, total_return, n_trades = summarize_trades(trades)
@@ -789,13 +719,11 @@ dir_stats = directional_breakdown(trades)
 # ----------------------------
 # Header signal & metrics
 # ----------------------------
-# --- Live header (replace your current block with this) ---
 signal_color = {"BUY": "green", "SELL": "red", "HOLD": "gray"}[signal]
 st.markdown(f"<h2 style='color:{signal_color};'>📢 Live Signal: {signal}</h2>", unsafe_allow_html=True)
 if reason:
     st.caption(reason)
 
-# Determine suggested live action (only show when not obvious)
 position_open = bool(trades) and trades[-1].exit_time is None
 position_side = trades[-1].side if position_open else None
 
@@ -805,20 +733,13 @@ if signal in ("SELL", "SHORT"):
 elif signal == "BUY":
     live_action = "CLOSE SHORT → OPEN LONG" if (position_open and position_side == "short") else "OPEN LONG"
 
-# Show the action only if it's more than the default advice
-default_action = (
-    "OPEN LONG" if signal == "BUY"
-    else ("OPEN SHORT" if signal in ("SELL", "SHORT") else "HOLD")
-)
+default_action = ("OPEN LONG" if signal == "BUY" else ("OPEN SHORT" if signal in ("SELL", "SHORT") else "HOLD"))
 if live_action != default_action:
     st.subheader(f"Live action: {live_action}")
 
-# (optional) Only show bias if it disagrees with the signal
 sig_dir = "LONG" if signal == "BUY" else ("SHORT" if signal in ("SELL", "SHORT") else None)
 if sig_dir != bias:
     st.markdown(f"### 📊 Current Bias: **{bias}**")
-
-
 
 colA, colB, colC, colD, colE, colF = st.columns([1.4, 1, 1, 1, 1, 1.2])
 colA.markdown(f"### 📊 Current Bias: **{bias}**")
@@ -850,23 +771,17 @@ def draw_sr_zones(
     last_px = float(prices["Close"].iloc[-1]) if len(prices) else np.nan
     use_hrect = hasattr(fig, "add_hrect")  # Plotly >= 5.3
 
-    # Colors (hex) — opacity handled via the 'opacity' kwarg
-    GREEN_FILL = "#4CAF50"
-    GREEN_LINE = "#2E7D32"
-    RED_FILL   = "#F44336"
-    RED_LINE   = "#B71C1C"
+    GREEN_FILL = "#4CAF50"; GREEN_LINE = "#2E7D32"
+    RED_FILL   = "#F44336"; RED_LINE   = "#B71C1C"
 
     def nearest(levels, ref, k):
-        if not levels:
-            return []
+        if not levels: return []
         if np.isfinite(ref):
             levels = sorted(levels, key=lambda y: abs(y - ref))
         return levels[:k]
 
-    # ---- Supports (green)
     for y in nearest(list(supports), last_px, max_each):
-        y0 = y * (1 - pct/100.0)
-        y1 = y * (1 + pct/100.0)
+        y0 = y * (1 - pct/100.0); y1 = y * (1 + pct/100.0)
         if use_hrect:
             fig.add_hrect(y0=y0, y1=y1, x0=x0, x1=x1,
                           fillcolor=GREEN_FILL, opacity=0.18,
@@ -881,10 +796,8 @@ def draw_sr_zones(
         if show_midline:
             fig.add_hline(y=y, line_color=GREEN_LINE, line_dash="dot", line_width=1)
 
-    # ---- Resistances (red)
     for y in nearest(list(resistances), last_px, max_each):
-        y0 = y * (1 - pct/100.0)
-        y1 = y * (1 + pct/100.0)
+        y0 = y * (1 - pct/100.0); y1 = y * (1 + pct/100.0)
         if use_hrect:
             fig.add_hrect(y0=y0, y1=y1, x0=x0, x1=x1,
                           fillcolor=RED_FILL, opacity=0.18,
@@ -930,7 +843,6 @@ if strategy == "Donchian Breakout":
     if short_gate:
         fig.add_trace(go.Scatter(x=sma_long.index, y=sma_long, name="SMA200", mode="lines"))
 else:
-    # SR zones like the screenshot
     if show_sr_zones and sr_plot_support is not None and sr_plot_resist is not None:
         draw_sr_zones(
             fig,
@@ -942,7 +854,6 @@ else:
             show_midline=show_zone_midline,
         )
     else:
-        # fallback: simple lines (only draw if we actually have levels)
         if sr_plot_support:
             for lvl in sr_plot_support:
                 fig.add_hline(y=lvl, line_width=1, line_dash="dot", line_color="green")
@@ -950,8 +861,7 @@ else:
             for lvl in sr_plot_resist:
                 fig.add_hline(y=lvl, line_width=1, line_dash="dot", line_color="red")
 
-
-# Trade markers (AFTER fig is created)
+# Trade markers
 long_x, long_y, short_x, short_y, exit_x, exit_y = [], [], [], [], [], []
 for t in trades:
     if t.side == "long":
@@ -983,5 +893,3 @@ fig.add_vrect(
 
 fig.update_layout(height=720, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="Price")
 st.plotly_chart(fig, use_container_width=True)
-
-
